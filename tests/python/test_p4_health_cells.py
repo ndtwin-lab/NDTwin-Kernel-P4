@@ -2786,14 +2786,14 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
                 pass
         return rc, (got or [None])[0], err.getvalue(), start, repo
 
-    def commit_once(self, when):
-        """A hook that commits a change to a file under tools/p4_health the first time `when(args)` holds."""
+    def commit_once(self, when, rel=("tools", "p4_health", "frames.py")):
+        """A hook that commits a change to `rel` the first time `when(args)` holds."""
         done = []
 
         def hook(repo, args):
             if not done and when(args):
                 done.append(1)
-                with open(os.path.join(repo, "tools", "p4_health", "frames.py"), "a") as fh:
+                with open(os.path.join(repo, *rel), "a") as fh:
                     fh.write("# a commit that landed\n")
                 self.git_in(repo, "add", ".")
                 self.git_in(repo, "commit", "-q", "-m", "lands during the lab path")
@@ -2811,9 +2811,16 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         self.assertNotIn("Traceback", err)
 
     def test_the_freeze_and_the_identity_use_the_sha_pinned_at_the_start(self):
-        """A commit that lands after the clean check (touching nothing the run copies) must not move the pin:
-        the Frozen names the commit HEAD was when the run began, not the one it is when the freeze runs."""
-        hook = self.commit_once(lambda a: a[0] == "status")
+        """A commit that lands after the clean and HEAD checks (touching nothing the run copies) must not move
+        the pin: the Frozen names the commit HEAD was when the run began, not the one it is when the freeze runs."""
+        asked = []
+
+        def after_the_recheck(a):
+            if a[:3] == ("rev-parse", "--verify", "HEAD"):
+                asked.append(1)
+                return len(asked) == 2                      # the pin, then the re-check after the clean check
+            return False
+        hook = self.commit_once(after_the_recheck, rel=("unrelated.txt",))
         rc, frozen, err, start, repo = self.lab_pinned(hook)
         self.assertEqual(rc, None, err)                     # S0 was reached
         self.assertEqual(frozen.head, start)
