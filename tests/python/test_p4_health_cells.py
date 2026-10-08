@@ -2608,6 +2608,7 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
                 stack.enter_context(mock.patch.object(S0M.S0, step, lambda self: None))
             stack.enter_context(mock.patch("p4_health.lab.run_lab", run_lab))
             stack.enter_context(mock.patch("sys.stderr", err))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             try:
                 rc = probe.main(["lab", "--run-dir", run_dir, "--owner", "o"])
             except Reached:
@@ -2656,9 +2657,16 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         self.assertIn("s2-runtime.json", err)
 
     def freeze_with_exercise(self):
+        """(Frozen, a copy of the committed exercise/ tree); the freeze's git is probe.py's own, which asks
+        probe.REPO -- the scratch repo, for as long as the test keeps it patched (patched_repo)."""
         import shutil
         import tempfile
+        from unittest import mock
+        from p4_health import probe
         repo = self.repo_with_exercise()
+        patch = mock.patch.object(probe, "REPO", repo)
+        patch.start()
+        self.addCleanup(patch.stop)
         fz, _run = self.freeze_in(repo)
         copy = os.path.join(tempfile.mkdtemp(prefix="p4h-excopy-%d-" % os.getpid()), "exercise")
         self.addCleanup(shutil.rmtree, os.path.dirname(copy), True)
@@ -2686,10 +2694,38 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         self.assertIn("src/hc_main.p4", str(ctx.exception))
         self.assertIn(fz.head, str(ctx.exception))
 
+    def test_the_exercise_copy_check_refuses_a_file_the_commit_does_not_have_and_one_it_lacks(self):
+        from p4_health import frozen as FZ
+        fz, copy = self.freeze_with_exercise()
+        with open(os.path.join(copy, "extra_model.py"), "w") as fh:
+            fh.write("# not committed\n")
+        with self.assertRaises(FZ.Refused) as ctx:
+            fz.check_exercise(copy)
+        self.assertIn("extra_model.py", str(ctx.exception))
+        os.remove(os.path.join(copy, "extra_model.py"))
+        os.remove(os.path.join(copy, "topology.json"))
+        with self.assertRaises(FZ.Refused) as ctx:
+            fz.check_exercise(copy)
+        self.assertIn("topology.json", str(ctx.exception))
+
+    def test_the_exercise_copy_check_refuses_a_link_in_the_copy(self):
+        from p4_health import frozen as FZ
+        fz, copy = self.freeze_with_exercise()
+        target = os.path.join(copy, "gen_runtime.py")
+        keep = os.path.join(os.path.dirname(copy), "same_bytes.py")
+        os.replace(target, keep)
+        os.symlink(keep, target)                # the very bytes the commit has, behind a link
+        with self.assertRaises(FZ.Refused):
+            fz.check_exercise(copy)
+
     def test_the_exercise_copy_check_is_a_refusal_when_git_cannot_answer(self):
         from p4_health import frozen as FZ
         fz, copy = self.freeze_with_exercise()
+        fz.check_exercise(copy)                 # it passes while git answers
         fz.git = lambda *a: (128, "")
+        with self.assertRaises(FZ.Refused):
+            fz.check_exercise(copy)
+        fz.git = None
         with self.assertRaises(FZ.Refused):
             fz.check_exercise(copy)
 
