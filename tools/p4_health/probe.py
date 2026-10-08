@@ -152,6 +152,13 @@ def cmd_judge(args):
 def cmd_lab(args):
     """S0 in the run directory, then the lab (lab.run_lab). The owner is required: every ndt
     call carries it (CLAUDE.md), and claims are made in its name."""
+    # (Cut 2 round 6, the pin-HEAD NIT) HEAD is resolved ONCE, before anything else is read: the modules are
+    # loaded, the tree is checked and the code is frozen against THIS commit, and the identity names it. A
+    # commit landing in between is refused below, not folded in.
+    h_rc, pinned = _git_run("rev-parse", "--verify", "HEAD")
+    if h_rc != 0 or not pinned:
+        print("refused: git could not name HEAD (rev-parse rc %s)" % (h_rc,), file=sys.stderr)
+        return 2
     load_lab_path()
     from p4_health import lab as L
     from p4_health.collect.config import Config
@@ -172,6 +179,18 @@ def cmd_lab(args):
         print("refused: tools/p4_health has uncommitted changes; a lab run runs only committed "
               "code:\n%s" % dirty, file=sys.stderr)
         return 2
+    h_rc, now = _git_run("rev-parse", "--verify", "HEAD")
+    if h_rc != 0 or now != pinned:
+        print("refused: HEAD moved from %s to %s while the lab path was loaded and the tree checked; the "
+              "modules and the clean check are of the first, run again" % (pinned, now or "(unreadable)"),
+              file=sys.stderr)
+        return 2
+
+    def git_at_pinned_head(*a):
+        """The freeze's git: the question 'what is HEAD' is answered with the pinned sha, not asked again."""
+        if a == ("rev-parse", "--verify", "HEAD"):
+            return 0, pinned
+        return _git_run(*a)
     run_dir = os.path.abspath(args.run_dir)
     run_id = os.path.basename(run_dir.rstrip("/"))
     # (Cut 2 round 4, F4) Freeze right after the clean check, before S0: every round runs these
@@ -179,7 +198,7 @@ def cmd_lab(args):
     # here, before any lab action (git that cannot answer is a refusal too)
     from p4_health import frozen as FZ
     try:
-        frozen = FZ.freeze(run_dir, repo=REPO, git=_git_run)
+        frozen = FZ.freeze(run_dir, repo=REPO, git=git_at_pinned_head)
     except FZ.Refused as exc:
         print("refused: %s" % exc, file=sys.stderr)
         return 2

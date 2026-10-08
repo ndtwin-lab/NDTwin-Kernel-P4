@@ -2945,6 +2945,33 @@ add "C2R6-10e. as_set does not turn a nested list into a tuple" \
     'test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells'
 
 
+# the pin-HEAD NIT: HEAD is pinned first; the clean check, the freeze and the identity use that sha
+add "C2R6-pin-a. probe.py lab goes on when HEAD cannot be named" \
+    "$PROBEPY" \
+    '    if h_rc != 0 or not pinned:' \
+    '    if False:  # MUTANT' \
+    'test_a_head_that_cannot_be_named_is_refused_before_the_clean_check'
+
+add "C2R6-pin-b. probe.py lab does not look at HEAD again after the clean check" \
+    "$PROBEPY" \
+    '    if h_rc != 0 or now != pinned:' \
+    '    if False:  # MUTANT' \
+    'test_a_commit_that_lands_after_head_was_pinned_and_before_the_clean_check_is_refused'
+
+add "C2R6-pin-c. the freeze resolves HEAD again instead of taking the pinned sha" \
+    "$PROBEPY" \
+    '        frozen = FZ.freeze(run_dir, repo=REPO, git=git_at_pinned_head)' \
+    '        frozen = FZ.freeze(run_dir, repo=REPO, git=_git_run)  # MUTANT' \
+    'test_the_freeze_and_the_identity_use_the_sha_pinned_at_the_start'
+
+add "C2R6-pin-d. the pin is not the first thing asked of git" \
+    "$PROBEPY" \
+    '    h_rc, pinned = _git_run("rev-parse", "--verify", "HEAD")' \
+    '    _git_run("status", "--porcelain", "--", "tools/p4_health")  # MUTANT
+    h_rc, pinned = _git_run("rev-parse", "--verify", "HEAD")' \
+    'test_a_clean_run_pins_head_once_before_anything_else_is_asked'
+
+
 CTRL_SRC="$TABLE"
 CTRL_ANCHOR='def g1_holds(g1):'
 CTRL_REPL='# MUTANT: a comment, and nothing else.
