@@ -3206,5 +3206,65 @@ class TestTheLabRun(Cut2):
             signal.signal(signal.SIGTERM, safety)
 
 
+    # --- round 6, finding 4: no stop falls between a round's record and its handler restore ----------------
+    def test_a_stop_from_a_hook_inside_finish_after_it_read_the_teardown_signal_means_b_is_not_claimed(self):
+        """(Finding 4) `_finish` reads `teardown_signal` on its first line; the round's handlers were put back
+        only afterwards. A stop between the two went to the teardown's noter after the read, was never read
+        again, and B was claimed and brought up over it. `_finish` and the restore are now under one signal
+        mask: the stop is delivered when the mask lifts, to the run-level handler."""
+        seen = []
+        safety = signal.signal(signal.SIGTERM, lambda n, f: seen.append(n))
+        proc = self.proc
+
+        def make(cfg, runner, bringup, pkg, run_id):
+            class Hooked(LR.LabRound):
+                def _finish(self, rec, t0):
+                    LR.LabRound._finish(self, rec, t0)          # it has read teardown_signal
+                    if bringup == "A":
+                        os.kill(os.getpid(), signal.SIGTERM)
+            return Hooked(cfg, runner, bringup, pkg, run_id, pid=4242, proc_root=proc, install_signals=True)
+        r = self.ndt_runner()
+        try:
+            rc, doc = LAB.run_lab(self.cfg, r, self.s0, self.cfg.run_dir, "run-x", round_cls=make,
+                                  tutorials_utils="/tutorials/utils", expected_tsv=self.expected,
+                                  b_kwargs=self.fake_time(), log=lambda *a: None)
+        finally:
+            signal.signal(signal.SIGTERM, safety)
+        claims = [c for c in r.calls if c["argv"][:2] == ["ndt", "claim"]]
+        self.assertEqual(len(claims), 1, "B was claimed over the stop")
+        self.assertEqual(seen, [])
+        self.assertEqual([b["id"] for b in doc["bringups"]], ["A"])
+        self.assertEqual((doc["bringups"][0]["down_rc"], doc["bringups"][0]["release_rc"]), (0, 0))
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        self.assertTrue(any("stop signal" in p_ for p_ in doc["problems"]), doc["problems"])
+
+    def test_a_round_cut_off_before_its_record_was_finished_is_not_complete_in_health_json(self):
+        """(Finding 4, the NIT) A first stop between the end of the body and the swap in `_handlers(False)`
+        raises inside the `finally`: the teardown and `_finish` never run, and the record lab.py takes still
+        said complete (set at the end of the body) with down_rc and release_rc None."""
+        seen = []
+        safety = signal.signal(signal.SIGTERM, lambda n, f: seen.append(n))
+        proc = self.proc
+
+        def make(cfg, runner, bringup, pkg, run_id):
+            class Early(LR.LabRound):
+                def _handlers(self, on):
+                    if not on and bringup == "A":
+                        os.kill(os.getpid(), signal.SIGTERM)    # the body is done; its raiser is still in
+                    LR.LabRound._handlers(self, on)
+            return Early(cfg, runner, bringup, pkg, run_id, pid=4242, proc_root=proc, install_signals=True)
+        try:
+            rc, doc = LAB.run_lab(self.cfg, self.ndt_runner(), self.s0, self.cfg.run_dir, "run-x", round_cls=make,
+                                  tutorials_utils="/tutorials/utils", expected_tsv=self.expected,
+                                  b_kwargs=self.fake_time(), log=lambda *a: None)
+        finally:
+            signal.signal(signal.SIGTERM, safety)
+        a = doc["bringups"][0]
+        self.assertEqual((a["id"], a["down_rc"], a["release_rc"]), ("A", None, None))
+        self.assertFalse(a["complete"])
+        self.assertTrue(any("cut off" in p_ for p_ in a["problems"]), a["problems"])
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+
+
 if __name__ == "__main__":
     unittest.main()
