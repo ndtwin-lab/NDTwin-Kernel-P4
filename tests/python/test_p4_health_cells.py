@@ -1763,6 +1763,8 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
                 raise MustNotRun("unexpected spawn %r" % (argv,))
             if exc is not None:
                 raise exc
+            if rc == 0 and not out and "rev-parse" in argv and "--verify" in argv:
+                return sp.CompletedProcess(argv, rc, stdout="ab" * 20 + "\n", stderr="")    # HEAD is a commit
             return sp.CompletedProcess(argv, rc, stdout=out, stderr="")
         return run
 
@@ -2744,6 +2746,103 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         fz.git = None
         with self.assertRaises(FZ.Refused):
             fz.check_exercise(copy)
+
+
+    # --- round 6, the pin-HEAD NIT: HEAD is pinned first, and the clean check, the freeze and the identity use it --
+    def lab_pinned(self, hook=None):
+        """probe.py lab in a scratch repo whose S0 is a marker that keeps the Frozen it was given. `hook(args)`
+        runs after each git call (to land a commit at a chosen moment). Returns (rc, Frozen or None, stderr,
+        the repo's HEAD when the run began, the repo)."""
+        import io
+        import tempfile
+        from unittest import mock
+        from p4_health import probe
+        repo = self.scratch_repo()
+        start = self.git_in(repo, "rev-parse", "HEAD")
+        got = []
+
+        class Reached(BaseException):
+            pass
+
+        def s0(*a, **kw):
+            got.append(kw.get("frozen"))
+            raise Reached()
+        real = probe._git_run
+
+        def git(*args):
+            out = real(*args)
+            if hook:
+                hook(repo, args)
+            return out
+        run_dir = tempfile.mkdtemp(prefix="p4h-pin-run-%d-" % os.getpid())
+        self.addCleanup(__import__("shutil").rmtree, run_dir, True)
+        err = io.StringIO()
+        rc = None
+        with mock.patch.object(probe, "REPO", repo), mock.patch.object(probe, "_git_run", git), \
+                mock.patch("p4_health.s0.S0", s0), mock.patch("sys.stderr", err):
+            try:
+                rc = probe.main(["lab", "--run-dir", run_dir, "--owner", "o"])
+            except Reached:
+                pass
+        return rc, (got or [None])[0], err.getvalue(), start, repo
+
+    def commit_once(self, when):
+        """A hook that commits a change to a file under tools/p4_health the first time `when(args)` holds."""
+        done = []
+
+        def hook(repo, args):
+            if not done and when(args):
+                done.append(1)
+                with open(os.path.join(repo, "tools", "p4_health", "frames.py"), "a") as fh:
+                    fh.write("# a commit that landed\n")
+                self.git_in(repo, "add", ".")
+                self.git_in(repo, "commit", "-q", "-m", "lands during the lab path")
+        return hook
+
+    def test_a_commit_that_lands_after_head_was_pinned_and_before_the_clean_check_is_refused(self):
+        """The freeze pinned HEAD only after the modules were loaded and the tree checked: a commit to
+        tools/p4_health in that one second made frozen_head name a commit the preloaded modules were not read
+        from. HEAD is pinned first; if it has moved when the clean check is done, the run is refused."""
+        hook = self.commit_once(lambda a: a[:3] == ("rev-parse", "--verify", "HEAD"))
+        rc, frozen, err, _start, _repo = self.lab_pinned(hook)
+        self.assertEqual((rc, frozen), (2, None))
+        self.assertIn("refused:", err)
+        self.assertIn("HEAD moved", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_the_freeze_and_the_identity_use_the_sha_pinned_at_the_start(self):
+        """A commit that lands after the clean check (touching nothing the run copies) must not move the pin:
+        the Frozen names the commit HEAD was when the run began, not the one it is when the freeze runs."""
+        hook = self.commit_once(lambda a: a[0] == "status")
+        rc, frozen, err, start, repo = self.lab_pinned(hook)
+        self.assertEqual(rc, None, err)                     # S0 was reached
+        self.assertEqual(frozen.head, start)
+        self.assertNotEqual(self.git_in(repo, "rev-parse", "HEAD"), start)      # and HEAD did move
+
+    def test_a_clean_run_pins_head_once_before_anything_else_is_asked(self):
+        """The control: with no commit landing, S0 is reached, the pin is the first git call, and the Frozen
+        carries it."""
+        calls = []
+        rc, frozen, err, start, _repo = self.lab_pinned(lambda repo, args: calls.append(args))
+        self.assertEqual(rc, None, err)
+        self.assertEqual(calls[0], ("rev-parse", "--verify", "HEAD"))
+        self.assertEqual(frozen.head, start)
+
+    def test_a_head_that_cannot_be_named_is_refused_before_the_clean_check(self):
+        from unittest import mock
+        from p4_health import probe
+        asked = []
+
+        def run(argv, **kw):
+            import subprocess as sp
+            asked.append(tuple(argv[3:]))
+            return sp.CompletedProcess(argv, 128 if argv[3:5] == ["rev-parse", "--verify"] else 0, stdout="", stderr="")
+        with mock.patch.object(probe.subprocess, "run", run), \
+                mock.patch("p4_health.frozen.freeze", side_effect=MustNotRun("the freeze must not start")), \
+                mock.patch("p4_health.s0.S0", side_effect=MustNotRun("S0 must not start")):
+            rc = probe.main(["lab", "--run-dir", "/nonexistent/run", "--owner", "o"])
+        self.assertEqual(rc, 2)
+        self.assertEqual([a for a in asked if a[0] == "status"], [])
 
 
 class TestCut2Decisions(unittest.TestCase):
