@@ -51,6 +51,20 @@ GATE_TEST="$HERE/test_p4_health_gate_scripts.sh"
 GATEPY="$HERE/mutate_p4_health.sh"
 SUMPY="$HERE/sum_p4_health_gate_shards.sh"
 
+# (round 6) Everything an uncommitted change to which would make the log lie about the commit it names: the subject,
+# its suites, the gate's own three scripts (mutation subjects now), and the files fresh_copy puts under test.
+WATCHED=(
+    tools/p4_health
+    tests/python/test_p4_health_cells.py
+    tests/python/test_p4_health_collect.py
+    tests/shell/test_p4_health_recover.sh
+    tests/shell/mutate_p4_health.sh
+    tests/shell/sum_p4_health_gate_shards.sh
+    tests/shell/test_p4_health_gate_scripts.sh
+    tools/p4_exercise
+    p4_proxy/mininet/grpc_ports.py
+)
+
 printf 'gate       : %s\n' "${BASH_SOURCE[0]}"
 printf 'cwd        : %s\n' "$PWD"
 printf 'interpreter: %s (%s)\n' "$(realpath "$PYTHON" 2>/dev/null || echo "MISSING: $PYTHON")" \
@@ -58,7 +72,7 @@ printf 'interpreter: %s (%s)\n' "$(realpath "$PYTHON" 2>/dev/null || echo "MISSI
 printf 'subject    : %s\n' "$PKG"
 printf 'HEAD       : %s (commit)\n' "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
 printf 'tree       : %s (git tree of tools/p4_health at HEAD)%s\n' "$(git -C "$REPO" rev-parse HEAD:tools/p4_health 2>/dev/null)" \
-    "$([[ -n "$(git -C "$REPO" status --porcelain -- tools/p4_health tests/python/test_p4_health_cells.py tests/python/test_p4_health_collect.py tests/shell/test_p4_health_recover.sh 2>/dev/null)" ]] && echo ' +UNCOMMITTED changes in the subject or its suites')"
+    "$([[ -n "$(git -C "$REPO" status --porcelain -- "${WATCHED[@]}" 2>/dev/null)" ]] && echo ' +UNCOMMITTED changes in the subject or its suites')"
 printf 'subject sha: %s\n' "$(cd "$PKG" && find . -name '*.py' -o -name '*.sh' | sort | xargs sha256sum | sha256sum | cut -c1-16)"
 echo
 
@@ -2709,8 +2723,8 @@ add "C2R5-6y. the shard-sum script takes a refused run's log" \
 
 add "C2R5-6z. the shard-sum script prints another line when all is well" \
     "$SUMPY" \
-    'print("GATE: %d mutations, %d survived, shards %d/%d ok"' \
-    'print("GATE ok: %d mutations, %d survived, shards %d/%d"' \
+    'print("GATE: %d mutations, %d survived, shards %d/%d ok, commit %s, tree %s, subject sha %s"' \
+    'print("GATE ok: %d mutations, %d survived, shards %d/%d, commit %s, tree %s, subject sha %s"' \
     '[four good shards of ten: the one GATE line, rc 0]'
 
 
@@ -2968,6 +2982,106 @@ add "C2R6-pin-d. the pin is not the first thing asked of git" \
     '    _git_run("status", "--porcelain", "--", "tools/p4_health")  # MUTANT
     h_rc, pinned = _git_run("rev-parse", "--verify", "HEAD")' \
     'test_a_clean_run_pins_head_once_before_anything_else_is_asked'
+
+
+# finding 6: the GATE line names what it certifies and refuses logs of another commit or tree; the gate marks
+# an uncommitted change to its own scripts and to what it copies
+add "C2R6-6a. the shard-sum script accepts logs of a commit that is not the checkout's HEAD" \
+    "$SUMPY" \
+    '        if commit != want:' \
+    '        if False:  # MUTANT' \
+    '[logs that agree with each other, of a commit that is not the checkout'"'"'s HEAD]'
+
+add "C2R6-6b. the shard-sum script accepts a tools/p4_health tree that is not the commit's" \
+    "$SUMPY" \
+    '        elif tree != want_tree:' \
+    '        elif False:  # MUTANT' \
+    "[logs of the checkout's HEAD that name another tools/p4_health tree]"
+
+add "C2R6-6c. the shard-sum script ignores --commit" \
+    "$SUMPY" \
+    '    if commit_arg is not None:' \
+    '    if False:  # MUTANT' \
+    "[--commit naming the logs' commit is accepted, and the GATE line names that commit]"
+
+add "C2R6-6d. the shard-sum script goes on when git cannot name HEAD" \
+    "$SUMPY" \
+    '    if h_rc != 0 or not head:' \
+    '    if False:  # MUTANT' \
+    '[a checkout git cannot read refuses the logs]'
+
+add "C2R6-6e. the GATE line does not carry the subject sha" \
+    "$SUMPY" \
+    'facts[0]["commit"], facts[0]["tree"], facts[0]["subj"]))' \
+    'facts[0]["commit"], facts[0]["tree"], "-"))  # MUTANT' \
+    '[four good shards of ten: the one GATE line, rc 0]'
+
+add "C2R6-6f. the GATE line does not carry the tree" \
+    "$SUMPY" \
+    'facts[0]["commit"], facts[0]["tree"], facts[0]["subj"]))' \
+    'facts[0]["commit"], facts[0]["commit"], facts[0]["subj"]))  # MUTANT' \
+    '[four good shards of ten: the one GATE line, rc 0]'
+
+add "C2R6-6g. the shard-sum script takes an option it does not know for a log" \
+    "$SUMPY" \
+    '    elif a.startswith("--"):
+        problems.append("unknown option %s" % a)' \
+    '    elif a.startswith("--"):
+        logs.append(a)  # MUTANT' \
+    '[an unknown option is refused]'
+
+add "C2R6-6h. --commit needs no value" \
+    "$SUMPY" \
+    '        if not args:
+            problems.append("--commit needs a commit")' \
+    '        if False:  # MUTANT
+            problems.append("--commit needs a commit")' \
+    '[--commit with nothing after it is refused]'
+
+add "C2R6-6i. the gate does not mark an uncommitted edit to its own mutation script" \
+    "$GATEPY" \
+    '    tests/shell/test_p4_health_rec''over.sh
+    tests/shell/mutate_p4_health.sh
+' \
+    '    tests/shell/test_p4_health_recover.sh
+' \
+    "[an uncommitted edit to the gate's own script tests/shell/mutate_p4_health.sh is marked]"
+
+add "C2R6-6j. the gate does not mark an uncommitted edit to the shard-sum script" \
+    "$GATEPY" \
+    '    tests/shell/mutate_p4_h''ealth.sh
+    tests/shell/sum_p4_health_gate_shards.sh
+' \
+    '    tests/shell/mutate_p4_health.sh
+' \
+    "[an uncommitted edit to the gate's own script tests/shell/sum_p4_health_gate_shards.sh is marked]"
+
+add "C2R6-6k. the gate does not mark an uncommitted edit to the gate-script tests" \
+    "$GATEPY" \
+    '    tests/shell/sum_p4_health_gate_sh''ards.sh
+    tests/shell/test_p4_health_gate_scripts.sh
+' \
+    '    tests/shell/sum_p4_health_gate_shards.sh
+' \
+    "[an uncommitted edit to the gate's own script tests/shell/test_p4_health_gate_scripts.sh is marked]"
+
+add "C2R6-6l. the gate does not mark an uncommitted edit to tools/p4_exercise" \
+    "$GATEPY" \
+    '    tests/shell/test_p4_health_gate_scr''ipts.sh
+    tools/p4_exercise
+' \
+    '    tests/shell/test_p4_health_gate_scripts.sh
+' \
+    '[an uncommitted edit to tools/p4_exercise/common.py is marked]'
+
+add "C2R6-6m. the gate does not mark an uncommitted edit to grpc_ports.py" \
+    "$GATEPY" \
+    '    tools/p4_exe''rcise
+    p4_proxy/mininet/grpc_ports.py
+' \
+    '    tools/p4_exercise
+' \
+    '[an uncommitted edit to p4_proxy/mininet/grpc_ports.py is marked]'
 
 
 CTRL_SRC="$TABLE"
