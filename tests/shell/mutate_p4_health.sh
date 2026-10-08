@@ -2879,7 +2879,7 @@ add "C2R6-5b. the temp file is not put in place with os.replace" \
     "$REPORTPY" \
     '        os.replace(tmp, path)' \
     '        os.rename(tmp, path)  # MUTANT' \
-    'test_an_error_writing_observations_json_leaves_no_health_json_and_exits_2'
+    'test_an_error_putting_observations_json_in_place_leaves_no_health_json_and_exits_2'
 
 add "C2R6-5c. report.dump writes in place" \
     "$REPORTPY" \
