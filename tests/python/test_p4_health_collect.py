@@ -3135,5 +3135,75 @@ class TestTheLabRun(Cut2):
         self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
 
 
+    # --- round 6, finding 3: the run-level stop handler is one-shot ------------------------------------------
+    def probe_main_over_run_lab(self, **kw):
+        """`probe.main(["lab", ...])` -- main()'s own exit-status handling -- around this harness's run_lab in
+        place of cmd_lab's S0, freeze and identity work. Returns (rc, run_lab's rc or None)."""
+        from p4_health import probe
+        got = []
+
+        def cmd_lab(args):
+            rc, _doc, _r = self.run_lab(**kw)
+            got.append(rc)
+            return rc
+        with mock.patch.object(probe, "cmd_lab", cmd_lab):
+            return probe.main(["lab", "--run-dir", self.cfg.run_dir, "--owner", "o"]), (got or [None])[0]
+
+    def test_a_second_stop_while_run_lab_handles_the_first_gives_rc_2_not_pythons_status_1(self):
+        """(Finding 3) The run-level handler stayed installed while run_lab's `except SignalAbort` body ran
+        (take_unrecorded copies files there): a second stop raised again, out of run_lab and out of main(), and
+        Python exits 1 -- PROBE-BROKEN, the see-red run's pass -- with no health.json. The first stop comes
+        between the rounds (as in test_a_stop_between_the_rounds_...), the second from inside the body."""
+        seen = []
+        safety = signal.signal(signal.SIGTERM, lambda n, f: seen.append(n))
+        real_keep, real_take = LAB.keep_state, LAB.take_unrecorded
+
+        def keep_then_kill(cfg, bringup):
+            real_keep(cfg, bringup)
+            if bringup == "A":
+                os.kill(os.getpid(), signal.SIGTERM)            # the first stop
+        asked = []
+
+        def take_after_a_second_stop(cfg, holder, recs):
+            asked.append(1)
+            os.kill(os.getpid(), signal.SIGTERM)                # the second, in the except body
+            real_take(cfg, holder, recs)
+        try:
+            with mock.patch.object(LAB, "keep_state", keep_then_kill), \
+                    mock.patch.object(LAB, "take_unrecorded", take_after_a_second_stop):
+                try:
+                    rc, _inner = self.probe_main_over_run_lab()
+                except LR.SignalAbort:
+                    self.fail("the second stop escaped run_lab and main(): Python would exit 1")
+        finally:
+            signal.signal(signal.SIGTERM, safety)
+        self.assertEqual((rc, asked, seen), (2, [1], []))
+        with open(os.path.join(self.cfg.run_dir, "health.json")) as fh:
+            h = json.load(fh)
+        self.assertEqual(h["verdict"], "INCOMPLETE")
+        self.assertTrue(any("stop signal 15" in p_ for p_ in h["problems"]), h["problems"])
+
+    def test_the_run_levels_first_stop_puts_a_noter_in_before_it_raises(self):
+        """The one-shot itself: after the first stop has raised, the handlers in place only note."""
+        seen = []
+        safety = signal.signal(signal.SIGTERM, lambda n, f: seen.append(n))
+        try:
+            old = LAB._stop_on_signals()
+            try:
+                with self.assertRaises(LR.SignalAbort):
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    for _ in range(1000):
+                        pass
+                os.kill(os.getpid(), signal.SIGTERM)            # must not raise
+                os.kill(os.getpid(), signal.SIGINT)
+                for _ in range(1000):
+                    pass
+            finally:
+                for sig, h in old.items():
+                    signal.signal(sig, h)
+        finally:
+            signal.signal(signal.SIGTERM, safety)
+
+
 if __name__ == "__main__":
     unittest.main()

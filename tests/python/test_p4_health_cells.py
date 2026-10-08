@@ -1882,6 +1882,22 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         self.assertIn("RuntimeError", err.getvalue())
         self.assertIn("S0 fell over", err.getvalue())
 
+    def test_a_stop_that_gets_out_of_the_lab_path_is_rc_2_stopped_not_pythons_status_1(self):
+        """(Round 6, finding 3) SignalAbort is a BaseException: main() caught only Exception, so a stop that
+        reached the run level outside run_lab's try (between the handler install and the try) left the
+        process as an uncaught exception -- status 1, the see-red run's pass, and no health.json."""
+        import io
+        from unittest import mock
+        from p4_health import probe
+        from p4_health.lab_round import SignalAbort
+        err = io.StringIO()
+        with mock.patch.object(probe, "cmd_lab", side_effect=SignalAbort(15)), mock.patch("sys.stderr", err):
+            rc = probe.main(["lab", "--run-dir", "/nonexistent/run", "--owner", "o"])
+        self.assertEqual(rc, 2)
+        self.assertIn("stopped", err.getvalue())
+        self.assertIn("INCOMPLETE", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
     # --- round 4, F8: an unreadable bmv2 override, with the REAL fingerprint ------------------
     def readable_machine(self, frozen=None):
         """Every part of the fingerprint except the fabric's bmv2 reads fine, so that part alone
