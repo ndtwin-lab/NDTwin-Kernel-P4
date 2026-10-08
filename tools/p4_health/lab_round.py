@@ -38,6 +38,7 @@ against the lab.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -314,6 +315,24 @@ class LabRound(object):
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
+    @contextlib.contextmanager
+    def _masked(self):
+        """(round 6, finding 4) The three stop signals blocked for the body of the `with`: a stop that arrives
+        meanwhile stays pending and is delivered, when the mask is put back, to whatever handler is then
+        installed. Chosen over re-checking `teardown_signal` after the restore because it leaves no window to
+        reason about (a re-check has its own gap after the check) and the stop reaches the run-level handler,
+        which ends the run, instead of being folded into a record that was already final. The probe has no
+        threads (nothing under tools/p4_health imports threading), so masking the main thread masks the
+        process."""
+        if not self.install_signals:
+            yield
+            return
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, self.SIGS)
+        try:
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
+
     def _handlers(self, on):
         if not self.install_signals:
             return
@@ -399,8 +418,13 @@ class LabRound(object):
                 # (round 5, NIT 10) the record is final BEFORE the run-level handlers come back: a stop
                 # that arrives from then on raises out of this method, and the record is whole for
                 # lab.py to take (self.rec). (NIT 13) A knob that was not put back is not a complete round.
-                self._finish(rec, t0)
-                self._restore_handlers()
+                # (round 6, finding 4) `_finish` reads teardown_signal and the restore puts the run-level
+                # handlers back, under ONE mask: a stop that lands between the two used to reach the
+                # teardown's noter after the read and be lost, with B claimed over it. Now it waits and is
+                # delivered, once the mask lifts, to the run-level handler.
+                with self._masked():
+                    self._finish(rec, t0)
+                    self._restore_handlers()
         return rec
 
     def _finish(self, rec, t0):

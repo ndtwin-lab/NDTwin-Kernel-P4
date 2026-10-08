@@ -2481,10 +2481,10 @@ add "C2R5-10a. the body's stop handler does not put the teardown's handler in be
 
 add "C2R5-10b. the record is finished after the run-level handlers are back" \
     "$LABROUND" \
-    '                self._finish(rec, t0)
-                self._restore_handlers()' \
-    '                self._restore_handlers()
-                self._finish(rec, t0)  # MUTANT' \
+    '                    self._finish(rec, t0)
+                    self._restore_handlers()' \
+    '                    self._restore_handlers()
+                    self._finish(rec, t0)  # MUTANT' \
     'test_a_stop_just_after_a_rounds_handlers_are_restored_keeps_that_rounds_record'
 
 add "C2R5-10c. a stop between a round and its record being appended loses the record" \
@@ -2830,6 +2830,41 @@ add "C2R6-3e. probe.py lab answers a stop that got out with status 1" \
                   file=sys.stderr)
             return 1  # MUTANT' \
     'test_a_stop_that_gets_out_of_the_lab_path_is_rc_2_stopped_not_pythons_status_1'
+
+
+# finding 4: _finish and the handler restore under one signal mask; a record cut off before _finish is not complete
+add "C2R6-4a. _finish and the handler restore are not under one signal mask" \
+    "$LABROUND" \
+    '                with self._masked():
+                    self._finish(rec, t0)' \
+    '                if True:  # MUTANT
+                    self._finish(rec, t0)' \
+    'test_a_stop_from_a_hook_inside_finish_after_it_read_the_teardown_signal_means_b_is_not_claimed'
+
+add "C2R6-4b. the mask lets the stop signals through" \
+    "$LABROUND" \
+    '        held = signal.pthread_sigmask(signal.SIG_BLOCK, self.SIGS)' \
+    '        held = signal.pthread_sigmask(signal.SIG_BLOCK, ())  # MUTANT' \
+    'test_a_stop_from_a_hook_inside_finish_after_it_read_the_teardown_signal_means_b_is_not_claimed'
+
+add "C2R6-4c. the mask is never lifted" \
+    "$LABROUND" \
+    '            signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    '            pass  # MUTANT' \
+    'test_a_stop_from_a_hook_inside_finish_after_it_read_the_teardown_signal_means_b_is_not_claimed'
+
+add "C2R6-4d. a round cut off before its record was finished keeps the complete the body set" \
+    "$LABPY" \
+    '                rec["complete"] = False
+                rec["problems"].append("the round was cut off' \
+    '                rec["problems"].append("the round was cut off' \
+    'test_a_round_cut_off_before_its_record_was_finished_is_not_complete_in_health_json'
+
+add "C2R6-4e. a round cut off before its record was finished says nothing about it" \
+    "$LABPY" \
+    '            if rec.get("seconds") is None:' \
+    '            if False:  # MUTANT' \
+    'test_a_round_cut_off_before_its_record_was_finished_is_not_complete_in_health_json'
 
 
 CTRL_SRC="$TABLE"

@@ -105,6 +105,12 @@ def take_unrecorded(cfg, holder, recs):
     for lr in holder.get("rounds") or []:
         rec = getattr(lr, "rec", None)
         if rec is not None and not any(rec is r for r in recs):
+            if rec.get("seconds") is None:
+                # (round 6, finding 4) `_finish` sets "seconds": it never ran, so the teardown may not have
+                # either, and `complete` may still be the True the end of the body set
+                rec["complete"] = False
+                rec["problems"].append("the round was cut off before its record was finished (its teardown may "
+                                       "not have run): finish with recover.sh on the run dir")
             recs.append(rec)
             keep_state(cfg, lr.bringup)
 
