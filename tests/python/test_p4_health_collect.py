@@ -1457,7 +1457,11 @@ class FakeFabric(object):
         self.pipelines = dict(PIPES4)
         self.ctrl_register_ok = False      # bmv2's P4Runtime refuses register writes today
         self.ctrl_connect_error = False    # (round 5, #4) no switch answers the controller's arbitration
-        self.ctrl_s2_not_primary = False   # (round 5, #4) s2 grants the pipeline but not primary
+        # (round 5, #4) s2 is not primary. HYPOTHETICAL, not copied from controller_ext.py: P4Runtime refuses a
+        # pipeline push from a backup client, so the real controller records set_pipeline_ok False plus
+        # set_pipeline_error for such a switch (controller_ext.py:150-156); this fake keeps set_pipeline_ok True and
+        # lets every attribution confirm -- a fair worst case for the rule, not the controller's own shape.
+        self.ctrl_s2_not_primary = False
         self.ctrl_fail = set()
         self.ctrl_no_result = False
         self.fail_entry = None
@@ -1937,6 +1941,8 @@ class FakeController(object):
                    "set_pipeline_ok": True, "routes_written": len(RUNTIMES[d]["table_entries"]),
                    "routes_failed": 0}
             if d == 2 and self.fab.ctrl_s2_not_primary:
+                # HYPOTHETICAL (see ctrl_s2_not_primary): the real controller would also record
+                # set_pipeline_ok False and set_pipeline_error here (controller_ext.py:150-156)
                 rec.update({"primary": False, "arbitration_status": 6})      # ALREADY_EXISTS: another election id holds it
             out[str(d)] = rec
         return out
@@ -2863,7 +2869,9 @@ class TestTheLabRun(Cut2):
         self.assertEqual(doc["attributions"]["ternary"]["ok"], False)
 
     def test_b_whose_controller_is_not_primary_on_s2_is_a_failed_b(self):
-        """s2 granted the pipeline (set_pipeline_ok) but not primary (controller_ext.py:148-157), and the
+        """HYPOTHETICAL shape: s2 granted the pipeline (set_pipeline_ok) but not primary. The real controller
+        would record set_pipeline_ok False plus set_pipeline_error for a backup client (controller_ext.py:150-156);
+        this is the worst case for the rule, not a copy of what the controller writes. And the
         attributions that followed all confirmed: B still did not do its part."""
         self.fab.ctrl_s2_not_primary = True
         rc, doc, _r = self.run_lab()

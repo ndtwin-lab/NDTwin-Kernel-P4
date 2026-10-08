@@ -2455,7 +2455,10 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         the controller records), and the files of everything loaded are listed at exit, with
         `p4_health.frames` resolved the way the controller's lazy import would resolve it. The frozen
         launch loads nothing from the shared tree; the same launch of the shared tree's files does (the
-        control: the detector is live)."""
+        control: the detector is live).
+        Note what "as B launches them" covers: the argv's shape. The interpreter here is `sys.executable`; B
+        starts the p4dev interpreter (round_b.py:119, `cfg.p4dev_python`). The files loaded are the same ones
+        only as long as the two interpreters import the same things from the same places."""
         import json
         import shutil
         import tempfile
