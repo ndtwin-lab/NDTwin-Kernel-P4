@@ -3182,6 +3182,7 @@ class TestTheLabRun(Cut2):
             h = json.load(fh)
         self.assertEqual(h["verdict"], "INCOMPLETE")
         self.assertTrue(any("stop signal 15" in p_ for p_ in h["problems"]), h["problems"])
+        self.assertTrue(any("further stop signal" in p_ for p_ in h["problems"]), h["problems"])   # noted
 
     def test_the_run_levels_first_stop_puts_a_noter_in_before_it_raises(self):
         """The one-shot itself: after the first stop has raised, the handlers in place only note."""
