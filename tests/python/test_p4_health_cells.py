@@ -1782,6 +1782,30 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
                     rc = probe.main(["lab", "--run-dir", "/nonexistent/run", "--owner", "o"])
                 self.assertEqual(rc, 2)
 
+    def test_a_git_status_that_cannot_answer_is_refused_before_s0(self):
+        """N3, the clean check's own refusal: HEAD is named (the pin answers), and `git status` then fails, times
+        out or is missing. Not 'clean'. (Since the round-6 pin, the test above is refused at the pin and no longer
+        reaches the status call; this one makes only `status` fail.)"""
+        import subprocess as sp
+        from unittest import mock
+        from p4_health import probe
+
+        def status_fails(kind):
+            def run(argv, **kw):
+                if argv[3:5] == ["rev-parse", "--verify"]:
+                    return sp.CompletedProcess(argv, 0, stdout="ab" * 20 + "\n", stderr="")
+                if kind == "rc":
+                    return sp.CompletedProcess(argv, 128, stdout="", stderr="")
+                raise sp.TimeoutExpired("git", 10) if kind == "timeout" else FileNotFoundError("git")
+            return run
+        for kind in ("rc", "timeout", "missing"):
+            with self.subTest(kind=kind):
+                with mock.patch.object(probe.subprocess, "run", status_fails(kind)), \
+                        mock.patch("p4_health.frozen.freeze", side_effect=MustNotRun("the freeze must not start")), \
+                        mock.patch("p4_health.s0.S0", side_effect=MustNotRun("S0 must not start")):
+                    rc = probe.main(["lab", "--run-dir", "/nonexistent/run", "--owner", "o"])
+                self.assertEqual(rc, 2)
+
     def test_a_missing_identity_record_stops_the_run_before_the_lab(self):
         """N3: the first authorized run's record is the baseline of the standing authorization;
         without it, or with an incomplete fingerprint, the lab is not touched."""

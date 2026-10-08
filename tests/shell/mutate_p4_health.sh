@@ -2023,7 +2023,7 @@ add "C2R3-N3a. a git that could not answer reads as a clean tree" \
         # (Cut 2 review N3) no answer is not "clean"' \
     '    if False:  # MUTANT
         # (Cut 2 review N3) no answer is not "clean"' \
-    'test_a_git_that_cannot_answer_is_refused_before_s0'
+    'test_a_git_status_that_cannot_answer_is_refused_before_s0'
 
 add "C2R3-N3b. the lab starts without a system-under-test record" \
     "$PROBEPY" \
