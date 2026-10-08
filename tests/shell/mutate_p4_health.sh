@@ -453,7 +453,7 @@ add "C5. health.json drops the controls" \
 # Review MAJ-4: every branch listed, decided on its own.
 add "B1. T1 never compares the dump" \
     "$TABLE" \
-    '        if set(got) != set(expect[dpid]):' \
+    '        if as_set(got) != as_set(expect[dpid]):' \
     '        if False:  # MUTANT' \
     'test_t1s_dump_half_decides_on_its_own'
 
@@ -1984,7 +1984,7 @@ add "C2R3-N1b. the stop signal is an Exception again (every except Exception swa
 
 add "C2R3-N1c. no handler between the rounds" \
     "$LABPY" \
-    '    old_handlers = _stop_on_signals() if signals else None' \
+    '    old_handlers = _stop_on_signals(noted) if signals else None' \
     '    old_handlers = None  # MUTANT' \
     'test_a_signal_between_the_rounds_ends_the_run'
 
@@ -2187,7 +2187,7 @@ add "C2R4-F4b. two empty answers from git count as equal hashes" \
 
 add "C2R4-F4c. probe.py freezes without asking git" \
     "$PROBEPY" \
-    '        frozen = FZ.freeze(run_dir, repo=REPO, git=_git_run)' \
+    '        frozen = FZ.freeze(run_dir, repo=REPO, git=git_at_pinned_head)' \
     '        frozen = FZ.freeze(run_dir, repo=REPO, git=None)  # MUTANT' \
     'test_an_edit_between_the_clean_check_and_the_freeze_is_refused_before_s0'
 
@@ -2382,8 +2382,8 @@ add "C2R5-7a. the blobs are asked for by HEAD at that moment, not by the pinned 
 
 add "C2R5-7b. the Frozen does not carry the sha it was checked against" \
     "$FROZENPY" \
-    '    return Frozen(base, sums, head)' \
-    '    return Frozen(base, sums)  # MUTANT' \
+    '    return Frozen(base, sums, head, git)' \
+    '    return Frozen(base, sums, git=git)  # MUTANT' \
     'test_head_is_resolved_once_and_every_blob_is_asked_for_by_that_sha'
 
 add "C2R5-7c. probe.py writes the identity of HEAD as it is now, not of the frozen commit" \
@@ -2541,8 +2541,8 @@ add "C2R5-11e. observations.json does not say whether the run was stopped" \
 
 add "C2R5-11f. observations.json does not carry the rounds' records" \
     "$LABPY" \
-    '                   "bringups": recs, "problems": problems}, fh,' \
-    '                   "bringups": [], "problems": problems}, fh,  # MUTANT' \
+    '                         "bringups": recs, "problems": problems}, default=_jsonable)' \
+    '                         "bringups": [], "problems": problems}, default=_jsonable)  # MUTANT' \
     'test_the_observations_a_run_writes_carry_what_the_offline_judge_reads'
 
 add "C2R5-12. the frozen set leaves out the adapter's common.py" \
@@ -2823,11 +2823,9 @@ add "C2R6-3d. probe.py lab lets a stop out of main() as an uncaught exception" \
 
 add "C2R6-3e. probe.py lab answers a stop that got out with status 1" \
     "$PROBEPY" \
-    'finish with recover.sh on the run dir." % exc.signum,
-                  file=sys.stderr)
+    '                  % (exc.signum, set_verdict_aside(args.run_dir)), file=sys.stderr)
             return 2' \
-    'finish with recover.sh on the run dir." % exc.signum,
-                  file=sys.stderr)
+    '                  % (exc.signum, set_verdict_aside(args.run_dir)), file=sys.stderr)
             return 1  # MUTANT' \
     'test_a_stop_that_gets_out_of_the_lab_path_is_rc_2_stopped_not_pythons_status_1'
 
