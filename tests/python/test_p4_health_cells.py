@@ -2586,11 +2586,12 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
 
         def run_lab(*a, **kw):
             raise Reached()
-        real = probe._git_run
+        real, edits = probe._git_run, []
 
         def git(*args):
             out = real(*args)
-            if args[0] == "status" and edit_after_status:
+            if args[0] == "status" and edit_after_status and not edits:
+                edits.append(1)                 # once: the clean check's own status call
                 edit_after_status()
             return out
         run_dir = tempfile.mkdtemp(prefix="p4h-ex-run-%d-" % os.getpid())
