@@ -51,6 +51,14 @@ GATE_TEST="$HERE/test_p4_health_gate_scripts.sh"
 GATEPY="$HERE/mutate_p4_health.sh"
 SUMPY="$HERE/sum_p4_health_gate_shards.sh"
 
+# (round 6, finding 7) A hash of the CONTENTS of the gate's own three scripts. `sha256sum a b c | sha256sum` hashes
+# sha256sum's output, which carries the scripts' paths: the same scripts at another path gave another hash, so two logs
+# could not be compared. Each file goes through stdin here, which has no name.
+gates_sum() {
+    local f
+    for f in "$GATEPY" "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64
+}
+
 # (round 6) Everything an uncommitted change to which would make the log lie about the commit it names: the subject,
 # its suites, the gate's own three scripts (mutation subjects now), and the files fresh_copy puts under test.
 WATCHED=(
@@ -74,6 +82,7 @@ printf 'HEAD       : %s (commit)\n' "$(git -C "$REPO" rev-parse HEAD 2>/dev/null
 printf 'tree       : %s (git tree of tools/p4_health at HEAD)%s\n' "$(git -C "$REPO" rev-parse HEAD:tools/p4_health 2>/dev/null)" \
     "$([[ -n "$(git -C "$REPO" status --porcelain -- "${WATCHED[@]}" 2>/dev/null)" ]] && echo ' +UNCOMMITTED changes in the subject or its suites')"
 printf 'subject sha: %s\n' "$(cd "$PKG" && find . -name '*.py' -o -name '*.sh' | sort | xargs sha256sum | sha256sum | cut -c1-16)"
+printf 'gates sum  : %s\n' "$(gates_sum | cut -c1-16)"
 echo
 
 ANCHOR_CHECK="${ANCHOR_CHECK:-0}"
@@ -3084,6 +3093,32 @@ add "C2R6-6m. the gate does not mark an uncommitted edit to grpc_ports.py" \
     '[an uncommitted edit to p4_proxy/mininet/grpc_ports.py is marked]'
 
 
+# finding 7: the hash of the gate's own scripts depends on their contents only
+add "C2R6-7a. the hash of the gate's scripts is of sha256sum's output, which carries their paths" \
+    "$GATEPY" \
+    '    for f in "$GATEPY"'' "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64' \
+    '    for f in "$GATEPY" "$SUMPY" "$GATE_TEST"; do sha256sum "$f"; done | sha256sum | cut -c1-64  # MUTANT' \
+    '[the same scripts in another directory give the same hash]'
+
+add "C2R6-7b. the hash of the gate's scripts leaves out the gate-script tests" \
+    "$GATEPY" \
+    '    for f in "$GATEPY"'' "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done' \
+    '    for f in "$GATEPY" "$SUMPY"; do sha256sum < "$f"; done  # MUTANT' \
+    '[an edit to test_p4_health_gate_scripts.sh changes the hash]'
+
+add "C2R6-7c. the hash of the gate's scripts leaves out the shard-sum script" \
+    "$GATEPY" \
+    '    for f in "$GATEPY"'' "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64' \
+    '    for f in "$GATEPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64  # MUTANT' \
+    '[an edit to sum_p4_health_gate_shards.sh changes the hash]'
+
+add "C2R6-7d. the hash of the gate's scripts leaves out the gate script itself" \
+    "$GATEPY" \
+    '    for f in "$GATEPY"'' "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64' \
+    '    for f in "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64  # MUTANT' \
+    '[an edit to mutate_p4_health.sh changes the hash]'
+
+
 CTRL_SRC="$TABLE"
 CTRL_ANCHOR='def g1_holds(g1):'
 CTRL_REPL='# MUTANT: a comment, and nothing else.
@@ -3139,7 +3174,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4-health-mutate-XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 SURVIVORS=0; MUTATIONS=0
 BASE_SUM="$(cd "$PKG" && find . -type f \( -name '*.py' -o -name '*.sh' -o -name '*.p4' \) | sort | xargs sha256sum | sha256sum)"
-GATES_SUM="$(sha256sum "$GATEPY" "$SUMPY" "$GATE_TEST" | sha256sum)"
+GATES_SUM="$(gates_sum)"
 
 fresh_copy() {
     rm -rf "$WORK/tools"; mkdir -p "$WORK/tools"
@@ -3261,14 +3296,16 @@ printf '\n--- was the original written? ---\n'
 NOW_SUM="$(cd "$PKG" && find . -type f \( -name '*.py' -o -name '*.sh' -o -name '*.p4' \) | sort | xargs sha256sum | sha256sum)"
 if [[ "$NOW_SUM" != "$BASE_SUM" ]]; then echo "  🔴 tools/p4_health CHANGED DURING THE GATE"; exit 2; fi
 echo "  byte-identical  tools/p4_health  ${BASE_SUM:0:16}"
-if [[ "$(sha256sum "$GATEPY" "$SUMPY" "$GATE_TEST" | sha256sum)" != "$GATES_SUM" ]]; then
+if [[ "$(gates_sum)" != "$GATES_SUM" ]]; then
     echo "  🔴 THE GATE'S OWN SCRIPTS CHANGED DURING THE GATE"; exit 2; fi
 echo "  byte-identical  the gate's own scripts  ${GATES_SUM:0:16}"
 after_red=$(red_tests)
 [[ -n "$after_red" ]] && { echo "🔴 a suite is red against the real files: $after_red"; exit 2; }
 echo "  suites green against the real files"
 
-(( MUTATIONS == SELECTED )) || { echo "REFUSED: $MUTATIONS mutations ran, $SELECTED were selected"; exit 2; }
+# (round 6, finding 7) There was a `(( MUTATIONS == SELECTED ))` guard here that could not fail: MUTATIONS is
+# incremented at the top of every mutate(), and the loop calls mutate() once per selected index. What really
+# checks that a shard ran its share is the shard-sum script (the "add up" check, against positions k, k+n, ...).
 printf '\n%s mutations, %s survived\n' "$MUTATIONS" "$SURVIVORS"
 [[ -n "$SHARD_N" ]] && printf 'SHARD %s/%s of %s mutations in the table\nNOT THE GATE BY ITSELF: shard %s/%s\n' \
     "$SHARD_K" "$SHARD_N" "${#MUT_LABEL[@]}" "$SHARD_K" "$SHARD_N"
