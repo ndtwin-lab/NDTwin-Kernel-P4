@@ -3377,7 +3377,8 @@ class TestTheLabRun(Cut2):
         from contextlib import redirect_stdout
         from p4_health import probe
         out = os.path.join(self.tmp, "judged-again")
-        with redirect_stdout(io.StringIO()):
+        # probe_version asks git for the probe's tree: the sealed suite spawns nothing, and it is no part of the answer
+        with redirect_stdout(io.StringIO()), mock.patch.object(probe, "probe_version", lambda head=None: "tree"):
             rc = probe.main(["judge", "--observations", os.path.join(self.cfg.run_dir, "observations.json"),
                              "--run-dir", out, "--expected", self.expected])
         with open(os.path.join(out, "health.json")) as fh:
