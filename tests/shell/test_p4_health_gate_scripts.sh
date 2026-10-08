@@ -12,6 +12,11 @@
 # only if they share one commit, tree and subject sha, every baseline, control and after-check is green, every
 # rc is 0 and the counts add up to the table; anything else exits non-zero.
 #
+# (round 6) The shard-sum script also compares the logs' commit and tools/p4_health tree with the checkout it runs
+# in (HEAD, or --commit), and prints them; the gate script marks an uncommitted change to any of its own scripts, to
+# tools/p4_exercise and to grpc_ports.py on its tree line, and prints a hash of its own scripts that does not depend on
+# where they are. Those are checked here against scratch git repos laid out as the gate expects.
+#
 # The scripts under test are $P4_HEALTH_GATE_UNDER_TEST's (the mutation gate points it at a mutated copy);
 # the default is this directory's. The gate script is only ever run into its refusals or, with PYTHON=/bin/true,
 # up to its baseline (which then finds no suite and stops): nothing here runs a real baseline.
@@ -27,6 +32,20 @@ check() {  # check <name> <condition...>
     local name="$1"; shift
     CHECKS=$((CHECKS + 1))
     if "$@"; then echo "  ok    $name"; else echo "  FAIL  $name"; FAILED=$((FAILED + 1)); fi
+}
+
+# --- scratch checkouts ---------------------------------------------------------------------------------
+GITC=(git -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false)
+mkrepo() {  # mkrepo <dir>: a git repo laid out as the gate and the shard-sum script expect, with the scripts under test in it
+    local d="$1"
+    mkdir -p "$d/tools/p4_health" "$d/tools/p4_exercise" "$d/p4_proxy/mininet" "$d/tests/shell" "$d/tests/python"
+    echo '# a module' > "$d/tools/p4_health/a.py"
+    echo '# common' > "$d/tools/p4_exercise/common.py"
+    echo '# ports' > "$d/p4_proxy/mininet/grpc_ports.py"
+    : > "$d/tests/python/test_p4_health_cells.py"; : > "$d/tests/python/test_p4_health_collect.py"
+    : > "$d/tests/shell/test_p4_health_recover.sh"
+    cp "$GATE" "$SUM" "$DIR/test_p4_health_gate_scripts.sh" "$d/tests/shell/"
+    git -C "$d" init -q && git -C "$d" add . && "${GITC[@]}" -C "$d" commit -q -m scratch
 }
 
 # --- the gate script's refusals -----------------------------------------------------------------------
@@ -85,10 +104,77 @@ no_banner_for_the_whole_gate() {
 }
 check "the whole gate does not" no_banner_for_the_whole_gate
 
+# --- the gate script's header (round 6) ----------------------------------------------------------------
+header() {  # header <scratch checkout>: the gate script of that checkout, up to its baseline; its output in $WORK/hdr.out
+    ( cd "$1" && env -u MUT_SHARD -u ONLY_LABEL_PREFIX -u ANCHOR_CHECK PYTHON=/bin/true timeout 60 \
+        bash tests/shell/mutate_p4_health.sh > "$WORK/hdr.out" 2>&1 )
+    grep -q '^HEAD ' "$WORK/hdr.out"
+}
+tree_line_marked() { grep '^tree ' "$WORK/hdr.out" | grep -q 'UNCOMMITTED'; }
+echo "--- the gate script marks an uncommitted change to anything it runs or tests"
+mkrepo "$WORK/g1"
+clean_has_no_mark() { header "$WORK/g1" && ! tree_line_marked; }
+check "a clean checkout's tree line carries no UNCOMMITTED mark" clean_has_no_mark
+edit_is_marked() {  # edit_is_marked <file of the scratch checkout>
+    local f="$1"
+    echo "# an edit nobody committed" >> "$WORK/g1/$f"
+    header "$WORK/g1"; local rc=1; tree_line_marked && rc=0
+    git -C "$WORK/g1" checkout -q -- "$f"
+    return $rc
+}
+for f in tools/p4_health/a.py tests/python/test_p4_health_cells.py tests/python/test_p4_health_collect.py \
+         tests/shell/test_p4_health_recover.sh; do
+    check "an uncommitted edit to $f is marked" edit_is_marked "$f"
+done
+for f in tests/shell/mutate_p4_health.sh tests/shell/sum_p4_health_gate_shards.sh \
+         tests/shell/test_p4_health_gate_scripts.sh; do
+    check "an uncommitted edit to the gate's own script $f is marked" edit_is_marked "$f"
+done
+check "an uncommitted edit to tools/p4_exercise/common.py is marked" edit_is_marked tools/p4_exercise/common.py
+check "an uncommitted edit to p4_proxy/mininet/grpc_ports.py is marked" edit_is_marked p4_proxy/mininet/grpc_ports.py
+new_file_is_marked() {
+    echo "# new" > "$WORK/g1/tools/p4_exercise/new_helper.py"
+    header "$WORK/g1"; local rc=1; tree_line_marked && rc=0
+    rm -f "$WORK/g1/tools/p4_exercise/new_helper.py"
+    return $rc
+}
+check "a new file in tools/p4_exercise is marked" new_file_is_marked
+doc_is_not_marked() {
+    mkdir -p "$WORK/g1/doc"; echo "notes" > "$WORK/g1/doc/notes.md"
+    header "$WORK/g1"; local rc=0; tree_line_marked && rc=1
+    rm -rf "$WORK/g1/doc"
+    return $rc
+}
+check "a file outside what the gate runs or tests is not marked" doc_is_not_marked
+
+gates_sum_of() { header "$1" && grep '^gates sum' "$WORK/hdr.out"; }
+echo "--- the hash of the gate's own scripts depends on their contents only"
+mkrepo "$WORK/elsewhere/deeper/g2"
+sum_independent_of_path() {
+    local a b; a="$(gates_sum_of "$WORK/g1")"; b="$(gates_sum_of "$WORK/elsewhere/deeper/g2")"
+    [[ -n "$a" && "$a" == "$b" ]]
+}
+check "the same scripts in another directory give the same hash" sum_independent_of_path
+sum_follows_content() {  # sum_follows_content <script>: an edit to it changes the hash
+    local f="tests/shell/$1" before after
+    before="$(gates_sum_of "$WORK/elsewhere/deeper/g2")"
+    echo "# changed" >> "$WORK/elsewhere/deeper/g2/$f"
+    after="$(gates_sum_of "$WORK/elsewhere/deeper/g2")"
+    git -C "$WORK/elsewhere/deeper/g2" checkout -q -- "$f"
+    [[ -n "$before" && -n "$after" && "$before" != "$after" ]]
+}
+for f in mutate_p4_health.sh sum_p4_health_gate_shards.sh test_p4_health_gate_scripts.sh; do
+    check "an edit to $f changes the hash" sum_follows_content "$f"
+done
+
 # --- the shard-sum script ------------------------------------------------------------------------------
-SHA=1111111111111111111111111111111111111111
-TREE=2222222222222222222222222222222222222222
+# the logs below are of a scratch checkout's commit: the script compares them with that checkout's HEAD
+REPO_S="$WORK/repo"; mkrepo "$REPO_S"
+SHA="$(git -C "$REPO_S" rev-parse HEAD)"
+TREE="$(git -C "$REPO_S" rev-parse HEAD:tools/p4_health)"
 SUBJ=3333333333333333
+export P4_HEALTH_SUM_REPO="$REPO_S"
+GATE_TAIL=", commit $SHA, tree $TREE, subject sha $SUBJ"
 mklog() {  # mklog <file> <k> <n> <labels> <mutations> [name=value]...   -- a shard log as the gate script writes it
     local file="$1" k="$2" n="$3" labels="$4" m="$5" i; shift 5
     local sha="$SHA" head="$SHA" tree="$TREE" subj="$SUBJ" survived=0 rc=0 baseline=1 control=1 ident=1 after=1 \
@@ -133,12 +219,12 @@ mklog() {  # mklog <file> <k> <n> <labels> <mutations> [name=value]...   -- a sh
     } > "$file"
     : "$rc"
 }
-good_set() {  # good_set <dir> <n> <labels> -- n consistent shard logs
-    local d="$1" n="$2" labels="$3" k m
+good_set() {  # good_set <dir> <n> <labels> [mklog option]... -- n consistent shard logs
+    local d="$1" n="$2" labels="$3" k m; shift 3
     mkdir -p "$d"
     for ((k = 0; k < n; k++)); do
         m=$(( k < labels ? (labels - k + n - 1) / n : 0 ))
-        mklog "$d/s$k.log" "$k" "$n" "$labels" "$m"
+        mklog "$d/s$k.log" "$k" "$n" "$labels" "$m" "$@"
     done
 }
 sum() { bash "$SUM" "$@"; }
@@ -147,12 +233,12 @@ sum_rc() { sum "$@" > "$WORK/sum.out" 2>&1; echo $?; }
 echo "--- the shard-sum script"
 good_set "$WORK/good" 4 10
 check "four good shards of ten: the one GATE line, rc 0" \
-    bash -c 'out="$(bash "$1" "$2"/s*.log 2>&1)"; rc=$?; [ "$rc" -eq 0 ] && [ "$out" == "GATE: 10 mutations, 0 survived, shards 4/4 ok" ]' _ "$SUM" "$WORK/good"
+    bash -c 'out="$(bash "$1" "$2"/s*.log 2>&1)"; rc=$?; [ "$rc" -eq 0 ] && [ "$out" == "GATE: 10 mutations, 0 survived, shards 4/4 ok$3" ]' _ "$SUM" "$WORK/good" "$GATE_TAIL"
 good_set "$WORK/good1" 1 7
 check "a single shard of the whole table (1/1) is the gate" \
-    bash -c 'out="$(bash "$1" "$2"/s0.log 2>&1)"; rc=$?; [ "$rc" -eq 0 ] && [ "$out" == "GATE: 7 mutations, 0 survived, shards 1/1 ok" ]' _ "$SUM" "$WORK/good1"
+    bash -c 'out="$(bash "$1" "$2"/s0.log 2>&1)"; rc=$?; [ "$rc" -eq 0 ] && [ "$out" == "GATE: 7 mutations, 0 survived, shards 1/1 ok$3" ]' _ "$SUM" "$WORK/good1" "$GATE_TAIL"
 check "the order of the logs on the command line does not matter" \
-    bash -c 'out="$(bash "$1" "$2"/s3.log "$2"/s1.log "$2"/s0.log "$2"/s2.log 2>&1)"; [ "$out" == "GATE: 10 mutations, 0 survived, shards 4/4 ok" ]' _ "$SUM" "$WORK/good"
+    bash -c 'out="$(bash "$1" "$2"/s3.log "$2"/s1.log "$2"/s0.log "$2"/s2.log 2>&1)"; [ "$out" == "GATE: 10 mutations, 0 survived, shards 4/4 ok$3" ]' _ "$SUM" "$WORK/good" "$GATE_TAIL"
 
 # each defect: a good set of four with ONE shard (s2) changed; the script must say no, say why, and print no GATE line
 refuses() {  # refuses <name> <reason fragment> <mklog option>...  -- s2 is made with the options
@@ -223,6 +309,63 @@ no_logs() { out="$(bash "$SUM" 2>&1)"; rc=$?; [[ "$rc" -ne 0 ]] && grep -q "^NOT
 check "no logs at all is refused, with a reason" no_logs
 missing_log() { out="$(bash "$SUM" /no/such/log 2>&1)"; rc=$?; [[ "$rc" -ne 0 ]] && grep -q "^NOT THE GATE:" <<<"$out"; }
 check "a log that does not exist is refused, with a reason" missing_log
+
+# --- (round 6) the logs must be of this checkout's commit and tree, or of --commit ---------------------
+echo "--- the logs must be of the checkout's HEAD and tools/p4_health tree, or of --commit"
+OTHER=4444444444444444444444444444444444444444
+refuses_other_head() {  # four logs that agree with each other, of a commit that is not the checkout's HEAD
+    local d="$WORK/bad-head"; good_set "$d" 4 10 sha=$OTHER head=$OTHER
+    refused_set "$d" "not the checkout's HEAD" "$d"/s*.log
+}
+check "logs that agree with each other, of a commit that is not the checkout's HEAD" refuses_other_head
+refuses_other_tree() {  # the right commit, a tools/p4_health tree that is not that commit's
+    local d="$WORK/bad-tree"; good_set "$d" 4 10 tree=$OTHER
+    refused_set "$d" "is not the tree of" "$d"/s*.log
+}
+check "logs of the checkout's HEAD that name another tools/p4_health tree" refuses_other_tree
+
+REPO_B="$WORK/repoB"; mkrepo "$REPO_B"
+B1="$(git -C "$REPO_B" rev-parse HEAD)"; B1TREE="$(git -C "$REPO_B" rev-parse HEAD:tools/p4_health)"
+echo "later, and nothing to do with the probe" > "$REPO_B/note.txt"
+git -C "$REPO_B" add . && "${GITC[@]}" -C "$REPO_B" commit -q -m "a later commit"
+B2="$(git -C "$REPO_B" rev-parse HEAD)"
+good_b() { good_set "$1" 4 10 sha=$B1 head=$B1 tree=$B1TREE; }
+head_has_moved_on() {  # the logs are of B1, HEAD is B2: no --commit, no gate
+    local d="$WORK/b-moved"; good_b "$d"
+    P4_HEALTH_SUM_REPO="$REPO_B" refused_set "$d" "not the checkout's HEAD" "$d"/s*.log
+}
+check "logs of an earlier commit than HEAD, with no --commit, are refused" head_has_moved_on
+commit_names_the_logs_commit() {
+    local d="$WORK/b-commit" out rc; good_b "$d"
+    out="$(P4_HEALTH_SUM_REPO="$REPO_B" bash "$SUM" --commit "$B1" "$d"/s*.log 2>&1)"; rc=$?
+    [[ "$rc" -eq 0 && "$out" == "GATE: 10 mutations, 0 survived, shards 4/4 ok, commit $B1, tree $B1TREE, subject sha $SUBJ" ]]
+}
+check "--commit naming the logs' commit is accepted, and the GATE line names that commit" commit_names_the_logs_commit
+commit_names_another() {
+    local d="$WORK/b-other"; good_b "$d"
+    P4_HEALTH_SUM_REPO="$REPO_B" refused_set "$d" "not --commit" --commit "$B2" "$d"/s*.log
+}
+check "--commit naming another commit than the logs' is refused" commit_names_another
+commit_is_not_a_commit() {
+    local d="$WORK/b-nocommit"; good_b "$d"
+    P4_HEALTH_SUM_REPO="$REPO_B" refused_set "$d" "is not a commit" --commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef "$d"/s*.log
+}
+check "--commit naming no commit of the checkout is refused" commit_is_not_a_commit
+commit_without_a_value() {
+    local d="$WORK/b-noval"; good_b "$d"
+    P4_HEALTH_SUM_REPO="$REPO_B" refused_set "$d" "--commit needs" "$d"/s*.log --commit
+}
+check "--commit with nothing after it is refused" commit_without_a_value
+unknown_option() {
+    local d="$WORK/b-unknown"; good_b "$d"
+    P4_HEALTH_SUM_REPO="$REPO_B" refused_set "$d" "unknown option" --frobnicate "$d"/s*.log
+}
+check "an unknown option is refused" unknown_option
+not_a_checkout() {  # git cannot name HEAD: the logs are certified by nothing
+    local d="$WORK/b-nogit"; good_set "$d" 4 10; mkdir -p "$WORK/not-a-repo"
+    P4_HEALTH_SUM_REPO="$WORK/not-a-repo" refused_set "$d" "could not name HEAD" "$d"/s*.log
+}
+check "a checkout git cannot read refuses the logs" not_a_checkout
 
 echo
 echo "Ran $CHECKS checks, $FAILED failed"
