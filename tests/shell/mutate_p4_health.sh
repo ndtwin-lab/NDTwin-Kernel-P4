@@ -2867,6 +2867,52 @@ add "C2R6-4e. a round cut off before its record was finished says nothing about 
     'test_a_round_cut_off_before_its_record_was_finished_is_not_complete_in_health_json'
 
 
+# finding 5: observations.json first, health.json last, through tmp + replace; the catch-all sets a verdict aside
+add "C2R6-5a. health.json is written before observations.json" \
+    "$LABPY" \
+    '    R.write_json_atomic(os.path.join(run_dir, "observations.json"),' \
+    '    R.dump(os.path.join(run_dir, "health.json"), doc)  # MUTANT
+    R.write_json_atomic(os.path.join(run_dir, "observations.json"),' \
+    'test_an_error_writing_observations_json_leaves_no_health_json_and_exits_2'
+
+add "C2R6-5b. the temp file is not put in place with os.replace" \
+    "$REPORTPY" \
+    '        os.replace(tmp, path)' \
+    '        os.rename(tmp, path)  # MUTANT' \
+    'test_an_error_writing_observations_json_leaves_no_health_json_and_exits_2'
+
+add "C2R6-5c. report.dump writes in place" \
+    "$REPORTPY" \
+    '    tmp = "%s.tmp-%d" % (path, os.getpid())' \
+    '    tmp = path  # MUTANT' \
+    'test_a_write_that_fails_half_way_leaves_the_earlier_file_whole'
+
+add "C2R6-5d. a failed write leaves its temp file behind" \
+    "$REPORTPY" \
+    '        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise' \
+    '        raise  # MUTANT' \
+    'test_a_write_that_fails_half_way_leaves_the_earlier_file_whole'
+
+add "C2R6-5e. the catch-all leaves an existing health.json as it is" \
+    "$PROBEPY" \
+    '    try:
+        os.replace(path, aside)' \
+    '    try:
+        return ""  # MUTANT
+        os.replace(path, aside)' \
+    'test_an_error_after_health_json_was_written_sets_it_aside_as_not_a_verdict'
+
+add "C2R6-5f. the catch-all message starts with refused:" \
+    "$PROBEPY" \
+    '            print("ERROR: the lab run ended on an exception' \
+    '            print("refused: the lab run ended on an exception' \
+    'test_the_catch_all_does_not_look_like_a_deliberate_refusal'
+
+
 CTRL_SRC="$TABLE"
 CTRL_ANCHOR='def g1_holds(g1):'
 CTRL_REPL='# MUTANT: a comment, and nothing else.

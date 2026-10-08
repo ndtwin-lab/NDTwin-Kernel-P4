@@ -233,6 +233,21 @@ def cmd_lab(args):
     return rc
 
 
+def set_verdict_aside(run_dir):
+    """(Cut 2 round 6, finding 5) A run that ends rc 2 on an exception must not leave a health.json that reads as
+    a verdict: an existing one is renamed health.json.not-a-verdict. Returns the sentence that says what was
+    done, "" when there was nothing to do."""
+    path = os.path.join(os.path.abspath(run_dir), "health.json")
+    if not os.path.lexists(path):
+        return ""
+    aside = path + ".not-a-verdict"
+    try:
+        os.replace(path, aside)
+    except OSError as exc:
+        return "health.json could NOT be set aside (%s): it is not a verdict, whatever it says." % exc
+    return "health.json was set aside as %s: it is not a verdict." % aside
+
+
 def main(argv=None):
     if os.geteuid() == 0:
         print("refusing to run as root (design 7.3)", file=sys.stderr)
@@ -267,16 +282,19 @@ def main(argv=None):
             # status for it is 1 -- PROBE-BROKEN, the see-red run's pass. A stop that reached the run level
             # outside run_lab's own try ends the run INCOMPLETE rc 2.
             print("stopped: signal %d ended the lab run outside any round's body; it is INCOMPLETE, not a "
-                  "verdict. If a round was under way, finish with recover.sh on the run dir." % exc.signum,
-                  file=sys.stderr)
+                  "verdict. %s If a round was under way, finish with recover.sh on the run dir."
+                  % (exc.signum, set_verdict_aside(args.run_dir)), file=sys.stderr)
             return 2
         except Exception:  # noqa: BLE001
             # (Cut 2 round 5, #2) Python's status for an uncaught exception is 1 -- PROBE-BROKEN, which on
             # the see-red run is the pass. Whatever the lab path did not foresee is INCOMPLETE rc 2.
             import traceback
             traceback.print_exc()
-            print("refused: the lab run ended on an exception (above); it is INCOMPLETE, not a verdict. "
-                  "If a round was under way, finish with recover.sh on the run dir.", file=sys.stderr)
+            # (round 6, finding 5) not `refused:` -- the prefix of the deliberate refusals -- and a health.json
+            # that is already on disk is set aside, so that rc and health.json cannot disagree
+            print("ERROR: the lab run ended on an exception (above); it is INCOMPLETE, not a verdict. %s "
+                  "If a round was under way, finish with recover.sh on the run dir."
+                  % set_verdict_aside(args.run_dir), file=sys.stderr)
             return 2
     ap.print_help()
     return 2

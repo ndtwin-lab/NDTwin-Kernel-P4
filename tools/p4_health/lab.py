@@ -289,13 +289,16 @@ def run_lab(cfg, runner, s0_out, run_dir, run_id, bringups=("A", "B"), only=None
     # (Cut 2 review m4) design 4.3's system_under_test and the Q6(a) gate fingerprint
     doc["system_under_test"] = (identity or {}).get("system_under_test")
     doc["gate_fingerprint"] = (identity or {}).get("gate_fingerprint")
+    # (round 6, finding 5) observations.json first and health.json LAST, each through tmp + os.replace: a write
+    # that fails (ENOSPC is the likely one) leaves no health.json carrying a verdict next to an rc of 2, and
+    # nothing is written after the file that says what the run was. (The log lines below can still fail; the
+    # catch-all in probe.main sets health.json aside as not-a-verdict when anything does.)
+    R.write_json_atomic(os.path.join(run_dir, "observations.json"),
+                        # (round 5, NIT 11) with what `probe.py judge` reads to give the headline this run got
+                        {"cells": observations, "self_checks": a.sc_observations if a else {},
+                         "bringups_complete": complete, "stopped": stopped, "see_red": bool(mutant),
+                         "bringups": recs, "problems": problems}, default=_jsonable)
     R.dump(os.path.join(run_dir, "health.json"), doc)
-    with open(os.path.join(run_dir, "observations.json"), "w", encoding="utf-8") as fh:
-        # (round 5, NIT 11) with what `probe.py judge` reads to give the headline this run got
-        json.dump({"cells": observations, "self_checks": a.sc_observations if a else {},
-                   "bringups_complete": complete, "stopped": stopped, "see_red": bool(mutant),
-                   "bringups": recs, "problems": problems}, fh,
-                  indent=2, sort_keys=True, default=_jsonable)
     log(R.render(rows, rollups))
     log("verdict %s%s" % (verdict, {"PROBE-BROKEN": "  -- NOT PUBLISHABLE",
                                     "SEE-RED-NOT-SEEN": "  -- the mutant was not noticed: the probe cannot see red"
