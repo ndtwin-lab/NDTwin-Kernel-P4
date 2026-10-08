@@ -1659,6 +1659,77 @@ class TestS0Cut2Checks(unittest.TestCase):
             self.assertEqual(argvs[-1], ["py-ctrl", want])
 
 
+    # --- round 6, finding 2: the controller trial loads the model from the run's exercise copy ------------
+    def test_the_controller_trial_loads_the_model_from_the_runs_exercise_copy_not_the_shared_tree(self):
+        """S0 copies `exercise/` into the run dir (`self.ex`) and every later step runs that copy; the
+        controller trial exec'd the SHARED tree's gen_runtime.py instead (ctrl_trial.gen, HERE/exercise),
+        minutes after the clean check. Here the copy's gen_runtime.py differs from the tree's in one
+        value (the CPU port): the throwaway switch must be started with the COPY's."""
+        import shutil
+        from unittest import mock
+        from p4_health import ctrl_trial as CT
+        x, _r = self.s0([])
+        shutil.copytree(os.path.join(os.path.dirname(PKG), "exercise"), x.ex,
+                        ignore=shutil.ignore_patterns("__pycache__", "build*"))
+        with open(os.path.join(x.ex, "gen_runtime.py"), "a") as fh:
+            fh.write("\nCPU_PORT = 4242  # the copy's, not the tree's\n")
+
+        class Stop(BaseException):
+            pass
+        seen = []
+
+        class FakeSwitch(object):
+            def __init__(self, *a, **kw):
+                seen.append(a[2])               # Throwaway(json, inputs, cpu_port, ...)
+                self.workdir, self.grpc_port, self.started_at = kw.get("workdir"), 29650, 0
+
+            def start(self):
+                pass
+
+            def stop(self):
+                return 0
+
+        def popen(argv, **kw):
+            raise Stop()
+        with mock.patch.object(CT.TW, "Throwaway", FakeSwitch), mock.patch.object(CT.subprocess, "Popen", popen), \
+                mock.patch("p4_health.vs_trial.fabric_binary", return_value="/y/bin/simple_switch_grpc"):
+            with self.assertRaises(Stop):
+                x.ctrl_trial()
+        self.assertEqual(seen, [4242])
+
+    def test_the_controller_trial_without_an_exercise_dir_uses_the_trees_model(self):
+        """The control of the test above: trial() called without an exercise directory (S0 on its own is
+        not the lab run's concern) still loads the tree's own gen_runtime.py."""
+        import tempfile
+        from unittest import mock
+        from p4_health import ctrl_trial as CT
+
+        class Stop(BaseException):
+            pass
+        seen = []
+
+        class FakeSwitch(object):
+            def __init__(self, *a, **kw):
+                seen.append(a[2])
+                self.workdir, self.grpc_port, self.started_at = kw.get("workdir"), 29650, 0
+
+            def start(self):
+                pass
+
+            def stop(self):
+                return 0
+
+        def popen(argv, **kw):
+            raise Stop()
+        d = tempfile.mkdtemp(prefix="p4h-ctrltrial-gen-%d-" % os.getpid())
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        with mock.patch.object(CT.TW, "Throwaway", FakeSwitch), mock.patch.object(CT.subprocess, "Popen", popen):
+            with self.assertRaises(Stop):
+                CT.trial(os.path.join(d, "build"), "/x/bmv2", ["cli"], os.path.join(d, "work"), "py-ctrl",
+                         "/tutorials/utils")
+        self.assertEqual(seen, [510])
+
+
 class TestTheLiveRunsIdentity(unittest.TestCase):
     """m4: a lab run refuses a dirty probe, and records the Q6(a) fingerprint and the system
     under test."""
@@ -2483,6 +2554,143 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         self.assertNotEqual(fp(), base)
         whole = ID.fingerprint(r, d, d, ["/no/python"], ntg=os.path.join(d, "no-ntg"))
         self.assertEqual(whole["sha256"], "incomplete")          # an unread part is not a match
+
+
+    # --- round 6, finding 2: S0's exercise copy is checked against the pinned commit --------------------
+    def repo_with_exercise(self):
+        """The scratch repo of the freeze tests, plus the package's own exercise/ tree, committed."""
+        import shutil
+        repo = self.scratch_repo()
+        shutil.copytree(os.path.join(os.path.dirname(PKG), "exercise"),
+                        os.path.join(repo, "tools", "p4_health", "exercise"),
+                        ignore=shutil.ignore_patterns("__pycache__", "build*"))
+        self.git_in(repo, "add", ".")
+        self.git_in(repo, "commit", "-q", "-m", "exercise")
+        return repo
+
+    def lab_with_the_real_s0(self, repo, edit_after_status=None):
+        """probe.py lab in `repo` with the REAL S0 class: its p4c calls all fail (nothing is compiled), the
+        steps after them are stubs, and `run_lab` is a marker. `edit_after_status` runs right after the
+        clean check answered -- an edit that lands before S0 copies `exercise/`. Returns (rc, run_lab
+        reached?, stderr, run dir)."""
+        import contextlib
+        import io
+        import tempfile
+        import types
+        from unittest import mock
+        from p4_health import probe
+        from p4_health import s0 as S0M
+
+        class Reached(BaseException):
+            pass
+
+        def run_lab(*a, **kw):
+            raise Reached()
+        real = probe._git_run
+
+        def git(*args):
+            out = real(*args)
+            if args[0] == "status" and edit_after_status:
+                edit_after_status()
+            return out
+        run_dir = tempfile.mkdtemp(prefix="p4h-ex-run-%d-" % os.getpid())
+        self.addCleanup(__import__("shutil").rmtree, run_dir, True)
+        err, reached = io.StringIO(), False
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(probe, "REPO", repo))
+            stack.enter_context(mock.patch.object(probe, "_git_run", git))
+            stack.enter_context(mock.patch.object(S0M, "EXERCISE", os.path.join(repo, "tools", "p4_health",
+                                                                                 "exercise")))
+            stack.enter_context(mock.patch.object(
+                S0M.S0, "run_cmd", lambda self, argv, **kw: types.SimpleNamespace(rc=1, stdout="", stderr="")))
+            for step in ("identity", "openapi", "pft_verdict"):
+                stack.enter_context(mock.patch.object(S0M.S0, step, lambda self: None))
+            stack.enter_context(mock.patch("p4_health.lab.run_lab", run_lab))
+            stack.enter_context(mock.patch("sys.stderr", err))
+            try:
+                rc = probe.main(["lab", "--run-dir", run_dir, "--owner", "o"])
+            except Reached:
+                rc, reached = None, True
+        return rc, reached, err.getvalue(), run_dir
+
+    def test_an_exercise_tree_that_is_what_the_commit_has_goes_on_to_the_lab(self):
+        """The control of the next tests: no edit, S0 copies exercise/ (the p4c builds leave build*/
+        directories beside it, and a __pycache__ may be there) and the run reaches run_lab."""
+        repo = self.repo_with_exercise()
+        rc, reached, err, _run = self.lab_with_the_real_s0(repo)
+        self.assertTrue(reached, (rc, err))
+        self.assertNotIn("refused", err)
+
+    def test_an_exercise_file_edited_after_the_clean_check_is_refused_before_any_lab_action(self):
+        """(Finding 2) The freeze checks seven files; `exercise/` is copied by S0 a little later and feeds
+        every expectation the lab run judges by (lab.load_model, s0's own model, the controller trial). An
+        edit that lands between the clean check and that copy used to be run, not refused."""
+        repo = self.repo_with_exercise()
+
+        def edit():
+            with open(os.path.join(repo, "tools", "p4_health", "exercise", "gen_runtime.py"), "a") as fh:
+                fh.write("\nCPU_PORT = 4242  # nobody committed this\n")
+        rc, reached, err, run = self.lab_with_the_real_s0(repo, edit_after_status=edit)
+        self.assert_refused_cleanly(rc, reached, err)
+        self.assertIn("gen_runtime.py", err)
+        self.assertFalse(os.path.exists(os.path.join(run, "s0.json")))
+
+    def test_an_exercise_file_that_was_not_there_when_the_commit_was_made_is_refused(self):
+        repo = self.repo_with_exercise()
+
+        def add():
+            with open(os.path.join(repo, "tools", "p4_health", "exercise", "extra_model.py"), "w") as fh:
+                fh.write("# a new file nobody committed\n")
+        rc, reached, err, _run = self.lab_with_the_real_s0(repo, edit_after_status=add)
+        self.assert_refused_cleanly(rc, reached, err)
+        self.assertIn("extra_model.py", err)
+
+    def test_an_exercise_file_that_went_missing_after_the_clean_check_is_refused(self):
+        repo = self.repo_with_exercise()
+
+        def delete():
+            os.remove(os.path.join(repo, "tools", "p4_health", "exercise", "runtime", "s2-runtime.json"))
+        rc, reached, err, _run = self.lab_with_the_real_s0(repo, edit_after_status=delete)
+        self.assert_refused_cleanly(rc, reached, err)
+        self.assertIn("s2-runtime.json", err)
+
+    def freeze_with_exercise(self):
+        import shutil
+        import tempfile
+        repo = self.repo_with_exercise()
+        fz, _run = self.freeze_in(repo)
+        copy = os.path.join(tempfile.mkdtemp(prefix="p4h-excopy-%d-" % os.getpid()), "exercise")
+        self.addCleanup(shutil.rmtree, os.path.dirname(copy), True)
+        shutil.copytree(os.path.join(repo, "tools", "p4_health", "exercise"), copy)
+        return fz, copy
+
+    def test_the_exercise_copy_check_passes_for_the_tree_the_commit_has_and_ignores_build_output(self):
+        fz, copy = self.freeze_with_exercise()
+        os.makedirs(os.path.join(copy, "build"))
+        with open(os.path.join(copy, "build", "hc_main.json"), "w") as fh:
+            fh.write("{}")
+        os.makedirs(os.path.join(copy, "build-mutant"))
+        os.makedirs(os.path.join(copy, "__pycache__"))
+        with open(os.path.join(copy, "__pycache__", "gen_runtime.cpython-313.pyc"), "wb") as fh:
+            fh.write(b"x")
+        fz.check_exercise(copy)
+
+    def test_the_exercise_copy_check_names_the_file_that_differs(self):
+        from p4_health import frozen as FZ
+        fz, copy = self.freeze_with_exercise()
+        with open(os.path.join(copy, "src", "hc_main.p4"), "a") as fh:
+            fh.write("// edited\n")
+        with self.assertRaises(FZ.Refused) as ctx:
+            fz.check_exercise(copy)
+        self.assertIn("src/hc_main.p4", str(ctx.exception))
+        self.assertIn(fz.head, str(ctx.exception))
+
+    def test_the_exercise_copy_check_is_a_refusal_when_git_cannot_answer(self):
+        from p4_health import frozen as FZ
+        fz, copy = self.freeze_with_exercise()
+        fz.git = lambda *a: (128, "")
+        with self.assertRaises(FZ.Refused):
+            fz.check_exercise(copy)
 
 
 class TestCut2Decisions(unittest.TestCase):
