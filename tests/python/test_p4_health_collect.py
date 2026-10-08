@@ -3266,5 +3266,109 @@ class TestTheLabRun(Cut2):
         self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
 
 
+    # --- round 6, finding 5: observations.json first, health.json last, each through tmp + replace --------------
+    def main_over_run_lab_capturing_stderr(self, log=None):
+        import io
+        from p4_health import probe
+        err = io.StringIO()
+
+        def cmd_lab(args):
+            rc, _doc = LAB.run_lab(self.cfg, self.ndt_runner(), self.s0, self.cfg.run_dir, "run-x",
+                                   round_cls=self.rounds(), tutorials_utils="/tutorials/utils",
+                                   expected_tsv=self.expected, a_kwargs={"hosts": None},
+                                   b_kwargs=self.fake_time(), log=log or (lambda *a: None))
+            return rc
+        with mock.patch.object(probe, "cmd_lab", cmd_lab), mock.patch("sys.stderr", err):
+            rc = probe.main(["lab", "--run-dir", self.cfg.run_dir, "--owner", "o"])
+        return rc, err.getvalue()
+
+    def failing_open(self, name):
+        """open() as lab/report see it, failing (ENOSPC) for a file whose name starts with `name` when it is
+        opened for writing: the file itself or the temp file it goes through."""
+        import errno
+        import builtins
+        real = builtins.open
+
+        def opener(file, mode="r", *a, **kw):
+            if "w" in mode and os.path.basename(str(file)).startswith(name):
+                raise OSError(errno.ENOSPC, "No space left on device", str(file))
+            return real(file, mode, *a, **kw)
+        return mock.patch("builtins.open", opener)
+
+    def failing_replace(self, name):
+        """os.replace as lab/report see it, failing (ENOSPC) for the file called `name`."""
+        import errno
+        real = os.replace
+
+        def replace(src, dst, *a, **kw):
+            if os.path.basename(str(dst)) == name:
+                raise OSError(errno.ENOSPC, "No space left on device", str(dst))
+            return real(src, dst, *a, **kw)
+        return mock.patch("os.replace", replace)
+
+    def assert_no_verdict_left(self, rc, err):
+        self.assertEqual(rc, 2)
+        self.assertIn("Traceback", err)
+        self.assertIn("No space left on device", err)
+        self.assertEqual([f for f in os.listdir(self.cfg.run_dir)
+                          if f.startswith("health.json") or f.startswith("observations.json")], [])
+
+    def test_an_error_writing_observations_json_leaves_no_health_json_and_exits_2(self):
+        """run_lab wrote health.json (the verdict) first and observations.json after it: an OSError on the
+        second (ENOSPC is the likely one) left a health.json with a verdict next to rc 2 and "refused: ...
+        not a verdict". The verdict file is now the LAST thing written."""
+        with self.failing_open("observations.json"):
+            rc, err = self.main_over_run_lab_capturing_stderr()
+        self.assert_no_verdict_left(rc, err)
+
+    def test_an_error_putting_observations_json_in_place_leaves_no_health_json_and_exits_2(self):
+        """The same when the temp file was written and the os.replace is what fails."""
+        with self.failing_replace("observations.json"):
+            rc, err = self.main_over_run_lab_capturing_stderr()
+        self.assert_no_verdict_left(rc, err)
+
+    def test_the_catch_all_does_not_look_like_a_deliberate_refusal(self):
+        """Since round 5 the tests told a crash from a refusal by the word "Traceback" alone; the crash message
+        also began with `refused:`, the prefix of the deliberate refusals."""
+        with self.failing_open("observations.json"):
+            _rc, err = self.main_over_run_lab_capturing_stderr()
+        self.assertFalse(any(line.startswith("refused:") for line in err.splitlines()), err)
+
+    def test_an_error_after_health_json_was_written_sets_it_aside_as_not_a_verdict(self):
+        """An exception once the verdict file is on disk (here the log call that prints the table) still ends
+        the run rc 2: the file, which would read as a verdict, is renamed, and the message says so."""
+        def log(line, *a):
+            if str(line).startswith("verdict "):            # run_lab's last words, after both files are on disk
+                raise OSError(5, "Input/output error")
+        rc, err = self.main_over_run_lab_capturing_stderr(log=log)
+        self.assertEqual(rc, 2)
+        run = self.cfg.run_dir
+        self.assertFalse(os.path.exists(os.path.join(run, "health.json")))
+        aside = os.path.join(run, "health.json.not-a-verdict")
+        self.assertTrue(os.path.exists(aside), os.listdir(run))
+        self.assertIn("health.json.not-a-verdict", err)
+        with open(aside) as fh:
+            self.assertIn("verdict", json.load(fh))
+
+    def test_a_write_that_fails_half_way_leaves_the_earlier_file_whole(self):
+        """report.dump goes through a temp file and os.replace: a dump that dies half-way neither truncates
+        the file that was there nor leaves the temp file behind."""
+        import errno
+        from p4_health import report as R
+        target = os.path.join(self.tmp, "health.json")
+        with open(target, "w") as fh:
+            fh.write('{"old": 1}\n')
+
+        def dump(doc, fh, **kw):
+            fh.write("{\"half\": ")
+            raise OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(R.json, "dump", dump):
+            with self.assertRaises(OSError):
+                R.dump(target, {"new": 2})
+        with open(target) as fh:
+            self.assertEqual(json.load(fh), {"old": 1})
+        self.assertEqual([f for f in os.listdir(self.tmp) if f.startswith("health.json") and f != "health.json"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
