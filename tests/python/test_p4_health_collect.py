@@ -3370,5 +3370,49 @@ class TestTheLabRun(Cut2):
         self.assertEqual([f for f in os.listdir(self.tmp) if f.startswith("health.json") and f != "health.json"], [])
 
 
+    # --- round 6, finding 10: what run_lab writes, `probe.py judge` reads back to the same answer --------------
+    def judged_again(self, doc):
+        """`probe.py judge` over the observations.json this harness's run_lab just wrote. Returns (rc, health)."""
+        import io
+        from contextlib import redirect_stdout
+        from p4_health import probe
+        out = os.path.join(self.tmp, "judged-again")
+        with redirect_stdout(io.StringIO()):
+            rc = probe.main(["judge", "--observations", os.path.join(self.cfg.run_dir, "observations.json"),
+                             "--run-dir", out, "--expected", self.expected])
+        with open(os.path.join(out, "health.json")) as fh:
+            return rc, json.load(fh)
+
+    def assert_the_same_answer_offline(self, rc, doc):
+        rc2, h2 = self.judged_again(doc)
+        self.assertEqual((h2["verdict"], rc2), (doc["verdict"], rc))
+        live = {c["id"]: (c["verdict"], c["reason"], c["delta"]) for c in doc["cells"] + doc["controls"]}
+        again = {c["id"]: (c["verdict"], c["reason"], c["delta"]) for c in h2["cells"] + h2["controls"]}
+        self.assertEqual(again, live)
+        self.assertEqual(h2["rollup"], json.loads(json.dumps(doc["rollup"], default=sorted)))
+
+    def test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells(self):
+        """(Finding 10) run_lab -> observations.json -> `probe.py judge`. After the JSON round trip the tuples
+        and sets are lists: t1 called set() on lists of lists (TypeError), and m1, m2, c1 compared a list with
+        a frozenset (always unequal: three cells silently RED). Hand-built recordings never showed it."""
+        rc, doc, _r = self.run_lab()
+        self.assertEqual((doc["verdict"], rc), ("COMPLETE", 0))
+        self.assert_the_same_answer_offline(rc, doc)
+
+    def test_a_see_red_runs_observations_judge_offline_to_the_same_headline_and_cells(self):
+        self.fab.count_k1 = False
+        self.fab.ttl_decrements = False
+        rc, doc, _r = self.run_lab(bringups=("A",), only=["K1", "TTL1"], mutant=True)
+        self.assertEqual((doc["verdict"], rc), ("PROBE-BROKEN", 1))
+        self.assert_the_same_answer_offline(rc, doc)
+
+    def test_a_stopped_runs_observations_judge_offline_to_the_same_headline_and_cells(self):
+        self.fab.count_k1 = False
+        self.fab.signal_in_sniffer = "TTL1"
+        rc, doc, _r = self.run_lab()
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        self.assert_the_same_answer_offline(rc, doc)
+
+
 if __name__ == "__main__":
     unittest.main()
