@@ -2790,6 +2790,48 @@ add "C2R6-2k. S0 does not hand its exercise copy to the controller trial" \
     'test_the_controller_trial_loads_the_model_from_the_runs_exercise_copy_not_the_shared_tree'
 
 
+# finding 3: a stop that reaches the run level a second time, or outside run_lab's try, ends rc 2
+add "C2R6-3a. the run-level stop handler stays installed after the first stop" \
+    "$LABPY" \
+    '        _swap_handlers({s: noter for s in STOP_SIGNALS})
+        raise SignalAbort(signum)' \
+    '        raise SignalAbort(signum)  # MUTANT' \
+    'test_a_second_stop_while_run_lab_handles_the_first_gives_rc_2_not_pythons_status_1'
+
+add "C2R6-3b. the run level's noter drops a stop" \
+    "$LABPY" \
+    '        noted.append(signum)' \
+    '        pass  # MUTANT' \
+    'test_a_second_stop_while_run_lab_handles_the_first_gives_rc_2_not_pythons_status_1'
+
+add "C2R6-3c. the run level's first stop does not note-only afterwards (the noter raises too)" \
+    "$LABPY" \
+    '    def noter(signum, _frame):
+        noted.append(signum)' \
+    '    def noter(signum, _frame):
+        noted.append(signum)
+        raise SignalAbort(signum)  # MUTANT' \
+    'test_the_run_levels_first_stop_puts_a_noter_in_before_it_raises'
+
+add "C2R6-3d. probe.py lab lets a stop out of main() as an uncaught exception" \
+    "$PROBEPY" \
+    '        except SignalAbort as exc:
+            # (round 6, finding 3)' \
+    '        except ZeroDivisionError as exc:  # MUTANT
+            # (round 6, finding 3)' \
+    'test_a_stop_that_gets_out_of_the_lab_path_is_rc_2_stopped_not_pythons_status_1'
+
+add "C2R6-3e. probe.py lab answers a stop that got out with status 1" \
+    "$PROBEPY" \
+    'finish with recover.sh on the run dir." % exc.signum,
+                  file=sys.stderr)
+            return 2' \
+    'finish with recover.sh on the run dir." % exc.signum,
+                  file=sys.stderr)
+            return 1  # MUTANT' \
+    'test_a_stop_that_gets_out_of_the_lab_path_is_rc_2_stopped_not_pythons_status_1'
+
+
 CTRL_SRC="$TABLE"
 CTRL_ANCHOR='def g1_holds(g1):'
 CTRL_REPL='# MUTANT: a comment, and nothing else.

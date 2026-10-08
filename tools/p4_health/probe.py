@@ -259,8 +259,17 @@ def main(argv=None):
     if args.cmd == "judge":
         return cmd_judge(args)
     if args.cmd == "lab":
+        from p4_health.lab_round import SignalAbort
         try:
             return cmd_lab(args)
+        except SignalAbort as exc:
+            # (round 6, finding 3) A BaseException: `except Exception` below does not see it, and Python's
+            # status for it is 1 -- PROBE-BROKEN, the see-red run's pass. A stop that reached the run level
+            # outside run_lab's own try ends the run INCOMPLETE rc 2.
+            print("stopped: signal %d ended the lab run outside any round's body; it is INCOMPLETE, not a "
+                  "verdict. If a round was under way, finish with recover.sh on the run dir." % exc.signum,
+                  file=sys.stderr)
+            return 2
         except Exception:  # noqa: BLE001
             # (Cut 2 round 5, #2) Python's status for an uncaught exception is 1 -- PROBE-BROKEN, which on
             # the see-red run is the pass. Whatever the lab path did not foresee is INCOMPLETE rc 2.
