@@ -289,6 +289,15 @@ def nonempty(*values):
     return all(isinstance(v, (list, tuple, set, frozenset, dict)) and len(v) > 0 for v in values)
 
 
+def as_set(items):
+    """(round 6, finding 10) The members of `items` as a frozenset, whether it is the set of tuples an observer
+    recorded or the list of lists a JSON file gives back for it: `probe.py judge` reads observations.json, where
+    every tuple and set has become a list, and a list is neither hashable nor equal to a frozenset."""
+    def hashable(x):
+        return tuple(hashable(i) for i in x) if isinstance(x, (list, tuple)) else x
+    return frozenset(hashable(i) for i in items)
+
+
 # --- the rows' functions, one block per dimension --------------------------------------------------
 
 def pl1(obs):
@@ -332,7 +341,7 @@ def t1(obs):
         got = dumps.get(dpid)
         if got is None:
             return not_run("s%s: no thrift dump" % dpid)
-        if set(got) != set(expect[dpid]):
+        if as_set(got) != as_set(expect[dpid]):
             return red("s%s: the thrift dump is not the package's entries" % dpid, "structural", "thrift")
     return green("recorded == applied, failed == 0, every dump matches entry for entry")
 
@@ -411,7 +420,7 @@ def m1(obs):
     a, o = A(obs), O(obs)
     if a["recorded"] < 1 or a["applied"] != a["recorded"]:
         return red("multicast applied %s of %s" % (a["applied"], a["recorded"]), "structural")
-    if o["s1_group1"] != frozenset({1, 2}):
+    if as_set(o["s1_group1"]) != frozenset({1, 2}):
         return red("thrift: s1's group 1 is %r, not {1, 2}" % (o["s1_group1"],), "structural", "thrift")
     return green("group 1 on s1 replicates to {p1, p2}")
 
@@ -422,7 +431,7 @@ def m2(obs):
         return broken("the probe declared no ports for group 2")
     if a["http"] != 200:
         return red("POST /p4/multicast_group answered %s" % a["http"], "structural")
-    if o["group2_after"] != frozenset(o["declared"]):
+    if as_set(o["group2_after"]) != as_set(o["declared"]):
         return red("thrift: group 2 is %r after the write" % (o["group2_after"],), "structural", "thrift")
     return green("group 2 written and replicating to the declared ports")
 
@@ -431,7 +440,7 @@ def c1(obs):
     a, o = A(obs), O(obs)
     if a["applied"] != 1:
         return red("clone applied %s, not 1" % a["applied"], "structural")
-    if o["ports"] != frozenset({1}):
+    if as_set(o["ports"]) != frozenset({1}):
         return red("thrift: session 7's group replicates to %r, not {p1}" % (o["ports"],),
                    "structural", "thrift")
     return green("session 7 on s2 mirrors to p1")

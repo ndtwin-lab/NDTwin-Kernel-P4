@@ -2913,6 +2913,38 @@ add "C2R6-5f. the catch-all message starts with refused:" \
     'test_the_catch_all_does_not_look_like_a_deliberate_refusal'
 
 
+# finding 10: the offline verdict command reads back what run_lab wrote
+add "C2R6-10a. T1 compares the thrift dump as a set of lists" \
+    "$TABLE" \
+    '        if as_set(got) != as_set(expect[dpid]):' \
+    '        if set(got) != set(expect[dpid]):  # MUTANT' \
+    'test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells'
+
+add "C2R6-10b. M1 compares the group's ports with a frozenset directly" \
+    "$TABLE" \
+    '    if as_set(o["s1_group1"]) != frozenset({1, 2}):' \
+    '    if o["s1_group1"] != frozenset({1, 2}):  # MUTANT' \
+    'test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells'
+
+add "C2R6-10c. M2 compares the group's ports with a frozenset directly" \
+    "$TABLE" \
+    '    if as_set(o["group2_after"]) != as_set(o["declared"]):' \
+    '    if o["group2_after"] != frozenset(o["declared"]):  # MUTANT' \
+    'test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells'
+
+add "C2R6-10d. C1 compares the mirror's ports with a frozenset directly" \
+    "$TABLE" \
+    '    if as_set(o["ports"]) != frozenset({1}):' \
+    '    if o["ports"] != frozenset({1}):  # MUTANT' \
+    'test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells'
+
+add "C2R6-10e. as_set does not turn a nested list into a tuple" \
+    "$TABLE" \
+    '        return tuple(hashable(i) for i in x) if isinstance(x, (list, tuple)) else x' \
+    '        return x  # MUTANT' \
+    'test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells'
+
+
 CTRL_SRC="$TABLE"
 CTRL_ANCHOR='def g1_holds(g1):'
 CTRL_REPL='# MUTANT: a comment, and nothing else.
