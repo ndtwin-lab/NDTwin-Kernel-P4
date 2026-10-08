@@ -36,15 +36,25 @@ from p4_health.collect.runner import Runner  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 #: (Cut 2 round 5, #5) Every module of the package that the probe process can load on a lab run. `cmd_lab`
-#: imports them all BEFORE its clean check, so that no probe code is read from the shared tree after the
-#: check: identity.py (the gate fingerprint, the standing authorization's baseline) and the modules S0
-#: imports lazily (vs_trial, ctrl_trial, round_b, ...) used to be first imported ~2 minutes later, from
-#: whatever the tree held then. Chosen over re-verifying each loaded module's file against HEAD just before
-#: run_lab because the check would compare the FILE, not the code the process loaded (an edit made and
-#: undone in between passes it), and because it could not cover a module loaded after it. What stays
-#: outside: the files run as scripts (probe.py itself, hostside.py -- root runs the frozen copy --,
-#: openapi_probe.py, capture_thrift_fixtures.py), and the window between the process's start and the check,
-#: in which the package's top-level imports (cells, collect.config, expected, report, runner) were read.
+#: imports them all BEFORE its clean check, so that no module of the package is first read from the shared
+#: tree after the check: identity.py (the gate fingerprint, the standing authorization's baseline) and the
+#: modules S0 imports lazily (vs_trial, ctrl_trial, round_b, ...) used to be first imported ~2 minutes later,
+#: from whatever the tree held then. Chosen over re-verifying each loaded module's file against HEAD just
+#: before run_lab because the check would compare the FILE, not the code the process loaded (an edit made and
+#: undone in between passes it), and because it could not cover a module loaded after it.
+#: What the list does not cover, and what covers it instead (round 6; "no probe code is read after the check"
+#: was never true):
+#:   * files exec'd by path, which are never in sys.modules: exercise/gen_runtime.py (the model). S0 copies
+#:     exercise/ into the run dir and checks the copy against the pinned commit right after compile_all
+#:     (frozen.check_tree: a mismatch is rc 2 before any lab action); lab.load_model, S0 and the controller trial
+#:     then load the COPY, never the shared tree's file.
+#:   * files run as scripts from the shared tree, read when they run and checked by nothing: probe.py itself,
+#:     openapi_probe.py, capture_thrift_fixtures.py, tools/p4_exercise/convert.py and preflight.py,
+#:     tools/test_workflow/heartbeat_drop_check.py, ndt and qdisc_snapshot.sh, and the live-p1 code_identity.py
+#:     and venv_fingerprint.sh. An edit to one of them, made before the run or during it, is used.
+#:   * hostside.py, which root runs: the frozen copy, checked against HEAD (frozen.py).
+#:   * the window between the process's start and the check, in which the package's top-level imports (cells,
+#:     collect.config, expected, report, runner) were read.
 #: tests: the list is the package's module list, less those script-only files.
 LAB_PATH_MODULES = (
     "p4_health.attribution", "p4_health.cells.table", "p4_health.cells.verdict", "p4_health.collect.config",
@@ -179,7 +189,12 @@ def cmd_lab(args):
     print("lab run %s -> %s  (HEAD %s, probe tree %s)" % (run_id, run_dir, ident["head"], ident["probe_tree"]))
     s0 = S0(run_dir, runner, py, frozen=frozen)
     s0.out["repo"] = ident
-    s0.run()
+    try:
+        s0.run()
+    except FZ.Refused as exc:
+        # (round 6, finding 2) S0's copy of exercise/ is not what the pinned commit has: no lab action
+        print("refused: %s" % exc, file=sys.stderr)
+        return 2
     print("S0 %s" % s0.out["verdict"])
     cfg = Config(run_dir, owner=owner)
     bringups = tuple(b for b in (args.bringups or "A,B").split(",") if b)

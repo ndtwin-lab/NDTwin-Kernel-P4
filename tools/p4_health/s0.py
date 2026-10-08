@@ -20,6 +20,7 @@ import re
 import shutil
 
 from . import frames as F
+from . import frozen as FZ
 from . import runtime_cli as RC
 from . import throwaway as TW
 from .cells import table as T
@@ -185,7 +186,7 @@ class S0(object):
     def compile_all(self):
         if os.path.exists(self.ex):
             shutil.rmtree(self.ex)
-        shutil.copytree(EXERCISE, self.ex, ignore=shutil.ignore_patterns("__pycache__", "build*"))
+        shutil.copytree(EXERCISE, self.ex, ignore=shutil.ignore_patterns(*FZ.COPY_IGNORE))
         src = os.path.join(self.ex, SRC_REL)
         for outdir, stem, defines in BUILDS:
             d = os.path.join(self.ex, outdir)
@@ -201,6 +202,15 @@ class S0(object):
             self.check("compile %s %s" % (key, " ".join(defines)), ok,
                        "p4info %s" % (self.out["builds"][key]["p4info_sha16"],))
         return all(b["rc"] == 0 for b in self.out["builds"].values())
+
+    def check_exercise_copy(self):
+        """(Cut 2 round 6, finding 2) The copy of exercise/ made at the start of compile_all is the model every
+        later step goes by (this class, lab.load_model, the controller trial). A lab run froze its code
+        against one pinned commit: the copy is checked against that commit as the frozen files are, and a
+        mismatch raises frozen.Refused -- `probe.py lab` answers rc 2 before any lab action. S0 on its own
+        (no frozen) has no commit to check against."""
+        if self.frozen is not None and getattr(self.frozen, "head", None):
+            self.frozen.check_exercise(self.ex)
 
     def p4info_identity(self):
         b = self.out["builds"]
@@ -590,7 +600,7 @@ class S0(object):
             ctrl = {"controller": self.frozen.controller} if self.frozen else {}
             results = [CT.trial(os.path.join(self.ex, "build"), b, self.thrift_cli,
                                 os.path.join(self.run_dir, "ctrl_trial_work", "%d" % i),
-                                default_p4dev_python(), utils, **ctrl)
+                                default_p4dev_python(), utils, exercise=self.ex, **ctrl)
                        for i, b in enumerate(("/usr/local/bin/simple_switch_grpc", fabric_binary()))]
         except Exception as exc:  # noqa: BLE001
             self.check("B's controller on throwaway simple_switch_grpc", False,
@@ -683,7 +693,9 @@ class S0(object):
 
     def run(self):
         os.makedirs(self.run_dir, exist_ok=True)
-        if self.compile_all():
+        built = self.compile_all()
+        self.check_exercise_copy()
+        if built:
             self.p4info_identity()
             self.take_inventory()
             self.packages()

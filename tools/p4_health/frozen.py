@@ -22,10 +22,14 @@ a 15-minute run, and `probe.py lab` checked it clean only once, so:
   * (round 5) the freeze only ever writes what is new: <run>/frozen must not exist, directories are
     made with mkdir (no exist_ok) and files opened O_CREAT|O_EXCL|O_NOFOLLOW, so a link planted at a
     destination is refused, not written through, and an earlier run's evidence is not replaced;
-  * the sha256 of every copy goes into health.json, root's three files also as `root_code`.
+  * the sha256 of every copy goes into health.json, root's three files also as `root_code`;
+  * (round 6) S0's copy of tools/p4_health/exercise/ -- the model every expectation, the controller trial and
+    lab.load_model go by -- is checked the same way against the pinned commit (Frozen.check_exercise, right
+    after S0's compile_all): a file that differs, is missing or is not in the commit is refused.
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import os
 import shutil
@@ -37,6 +41,10 @@ ROOT_FILES = ("p4_health/hostside.py", "p4_health/frames.py", "p4_health/__init_
 B_FILES = ("p4_health/controller_ext.py",
            "p4_exercise/run_external_controller.py", "p4_exercise/common.py", "p4_exercise/__init__.py")
 DIRNAME = "frozen"
+#: (round 6) the tree S0 copies into <run>/exercise/, and what that copy leaves out: bytecode and the p4c output
+#: directories (build, build-mutant, build-fwd) S0 creates beside the sources. s0.compile_all uses the same patterns.
+EXERCISE_REL = "tools/p4_health/exercise"
+COPY_IGNORE = ("__pycache__", "build*")
 
 
 class Refused(RuntimeError):
@@ -44,10 +52,16 @@ class Refused(RuntimeError):
 
 
 class Frozen(object):
-    def __init__(self, base, sums, head=None):
+    def __init__(self, base, sums, head=None, git=None):
         self.base = base                    # <run>/frozen
         self.sums = sums                    # {"p4_health/hostside.py": sha256, ...}
         self.head = head                    # the commit every copy was checked against, or None (unchecked)
+        self.git = git                      # git(*args) -> (rc, stdout) that pinned it, for later checks
+
+    def check_exercise(self, copy_dir):
+        """Refused unless `copy_dir` -- S0's copy of tools/p4_health/exercise -- is exactly what the pinned
+        commit has there (see check_tree)."""
+        check_tree(copy_dir, EXERCISE_REL, self.head, self.git)
 
     def path(self, rel):
         return os.path.join(self.base, rel)
@@ -75,6 +89,62 @@ def copy_file(src, dst):
     fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
     with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
         shutil.copyfileobj(inp, out)
+
+
+def _ignored(rel):
+    """True when s0's copytree would have left `rel` (a path relative to the copied tree) out."""
+    return any(fnmatch.fnmatch(part, pat) for part in rel.split("/") for pat in COPY_IGNORE)
+
+
+def check_tree(copy_dir, rel_dir, head, git):
+    """(round 6) The files under `copy_dir` must be exactly the files the commit `head` has under `rel_dir`
+    (less what the copy leaves out, COPY_IGNORE), each byte-identical to the commit's blob: `git hash-object
+    --no-filters <file>` against the blob `git ls-tree` names, the freeze's own comparison. A file that
+    differs, one the commit does not have, one the commit has and the copy lacks, a link, an entry that is not a
+    plain file, and git that cannot answer are all Refused."""
+    if git is None or not head:
+        raise Refused("cannot check %s against the commit: no pinned commit (or no git) to check it with" % copy_dir)
+    rc, listing = git("ls-tree", "-r", "-z", "--full-tree", head, "--", rel_dir)
+    if rc != 0 or not listing:
+        raise Refused("git could not list %s at %s (ls-tree rc %s)" % (rel_dir, head, rc))
+    committed = {}
+    for entry in listing.split("\0"):
+        if not entry:
+            continue
+        meta, _tab, path = entry.partition("\t")
+        fields = meta.split()
+        rel = path[len(rel_dir) + 1:]
+        if len(fields) != 3 or not path.startswith(rel_dir + "/"):
+            raise Refused("git ls-tree gave an entry this check cannot read: %r" % (entry,))
+        if _ignored(rel):
+            continue
+        if fields[0] not in ("100644", "100755") or fields[1] != "blob":
+            raise Refused("%s/%s is not a plain file in %s (mode %s, %s)" % (rel_dir, rel, head, fields[0], fields[1]))
+        committed[rel] = fields[2]
+    found = {}
+    for dirpath, dirs, files in os.walk(copy_dir):
+        dirs[:] = [d for d in dirs if not _ignored(d)]
+        for name in files:
+            if _ignored(name):
+                continue
+            full = os.path.join(dirpath, name)
+            found[os.path.relpath(full, copy_dir).replace(os.sep, "/")] = full
+        for d in dirs:
+            if os.path.islink(os.path.join(dirpath, d)):
+                raise Refused("%s is a link: not what %s has" % (os.path.join(dirpath, d), head))
+    extra, missing = sorted(set(found) - set(committed)), sorted(set(committed) - set(found))
+    if extra or missing:
+        raise Refused("the copy of %s is not what %s has (not in the commit: %s; missing from the copy: %s)"
+                      % (rel_dir, head, ", ".join(extra) or "-", ", ".join(missing) or "-"))
+    for rel in sorted(found):
+        if os.path.islink(found[rel]):
+            raise Refused("%s/%s is a link in the copy: not what %s has" % (rel_dir, rel, head))
+        h_rc, h = git("hash-object", "--no-filters", found[rel])
+        if h_rc != 0 or not h:
+            raise Refused("git could not hash %s (rc %s)" % (found[rel], h_rc))
+        if h != committed[rel]:
+            raise Refused("%s/%s is not what %s has: the copy hashes to %s, the commit's blob is %s "
+                          "(edited since the clean check?)" % (rel_dir, rel, head, h, committed[rel]))
 
 
 def freeze(run_dir, repo=None, git=None):
@@ -120,4 +190,4 @@ def freeze(run_dir, repo=None, git=None):
             if h != blob:
                 raise Refused("tools/%s is not what %s has: the copy hashes to %s, the commit's blob is %s "
                               "(edited since the clean check?)" % (rel, head, h, blob))
-    return Frozen(base, sums, head)
+    return Frozen(base, sums, head, git)

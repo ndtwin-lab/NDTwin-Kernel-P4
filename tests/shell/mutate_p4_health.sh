@@ -2714,6 +2714,82 @@ add "C2R5-6z. the shard-sum script prints another line when all is well" \
     '[four good shards of ten: the one GATE line, rc 0]'
 
 
+# --- round 6 (C2R6-): the fifth round's open items ----------------------------------------------------------
+# finding 2: S0's copy of exercise/ is checked against the pinned commit, and the controller trial loads the copy
+add "C2R6-2a. S0 does not check its exercise copy against the pinned commit" \
+    "$S0PY" \
+    '        if self.frozen is not None and getattr(self.frozen, "head", None):
+            self.frozen.check_exercise(self.ex)' \
+    '        if False:  # MUTANT
+            self.frozen.check_exercise(self.ex)' \
+    'test_an_exercise_file_edited_after_the_clean_check_is_refused_before_any_lab_action'
+
+add "C2R6-2b. the exercise copy check is skipped when the compile failed" \
+    "$S0PY" \
+    '        built = self.compile_all()
+        self.check_exercise_copy()' \
+    '        built = self.compile_all()
+        if built:  # MUTANT
+            self.check_exercise_copy()' \
+    'test_an_exercise_file_edited_after_the_clean_check_is_refused_before_any_lab_action'
+
+add "C2R6-2c. the exercise copy check does not compare the bytes" \
+    "$FROZENPY" \
+    '        if h != committed[rel]:' \
+    '        if False:  # MUTANT' \
+    'test_the_exercise_copy_check_names_the_file_that_differs'
+
+add "C2R6-2d. a file the commit does not have is accepted in the exercise copy" \
+    "$FROZENPY" \
+    '    if extra or missing:' \
+    '    if missing:  # MUTANT' \
+    'test_the_exercise_copy_check_refuses_a_file_the_commit_does_not_have_and_one_it_lacks'
+
+add "C2R6-2e. a file the commit has may be missing from the exercise copy" \
+    "$FROZENPY" \
+    '    if extra or missing:' \
+    '    if extra:  # MUTANT' \
+    'test_the_exercise_copy_check_refuses_a_file_the_commit_does_not_have_and_one_it_lacks'
+
+add "C2R6-2f. a link in the exercise copy is followed" \
+    "$FROZENPY" \
+    '        if os.path.islink(found[rel]):' \
+    '        if False:  # MUTANT' \
+    'test_the_exercise_copy_check_refuses_a_link_in_the_copy'
+
+add "C2R6-2g. the exercise copy check passes without a commit or git to check against" \
+    "$FROZENPY" \
+    '    if git is None or not head:' \
+    '    if False:  # MUTANT' \
+    'test_the_exercise_copy_check_is_a_refusal_when_git_cannot_answer'
+
+add "C2R6-2h. the check does not leave out what the copy leaves out" \
+    "$FROZENPY" \
+    'COPY_IGNORE = ("__pycache__", "build*")' \
+    'COPY_IGNORE = ("__pycache__",)  # MUTANT' \
+    'test_the_exercise_copy_check_passes_for_the_tree_the_commit_has_and_ignores_build_output'
+
+add "C2R6-2i. probe.py lab lets a refused exercise copy out as a crash" \
+    "$PROBEPY" \
+    '    except FZ.Refused as exc:
+        # (round 6, finding 2)' \
+    '    except ZeroDivisionError as exc:  # MUTANT
+        # (round 6, finding 2)' \
+    'test_an_exercise_file_edited_after_the_clean_check_is_refused_before_any_lab_action'
+
+add "C2R6-2j. the controller trial ignores the exercise directory it is given" \
+    "$CTRLTRIAL" \
+    '"hc_gen", os.path.join(exercise or os.path.join(HERE, "exercise"), "gen_runtime.py"))' \
+    '"hc_gen", os.path.join(os.path.join(HERE, "exercise"), "gen_runtime.py"))  # MUTANT' \
+    'test_the_controller_trial_loads_the_model_from_the_runs_exercise_copy_not_the_shared_tree'
+
+add "C2R6-2k. S0 does not hand its exercise copy to the controller trial" \
+    "$S0PY" \
+    'default_p4dev_python(), utils, exercise=self.ex, **ctrl)' \
+    'default_p4dev_python(), utils, **ctrl)  # MUTANT' \
+    'test_the_controller_trial_loads_the_model_from_the_runs_exercise_copy_not_the_shared_tree'
+
+
 CTRL_SRC="$TABLE"
 CTRL_ANCHOR='def g1_holds(g1):'
 CTRL_REPL='# MUTANT: a comment, and nothing else.
