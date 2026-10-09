@@ -3119,6 +3119,142 @@ add "C2R6-7d. the hash of the gate's scripts leaves out the gate script itself" 
     '[an edit to mutate_p4_health.sh changes the hash]'
 
 
+# --- round 7 (C2R7-): the sixth round's review ---------------------------------------------------------------
+# finding 1: no thread of the process may be able to take a stop while a round's mask is up (lab.run_lab refuses),
+# and the ValueSet trial, which starts gRPC threads in this process, runs with the three signals blocked
+add "C2R7-1a. run_lab does not look at the process's threads" \
+    "$LABPY" \
+    '    if prepared is not None and signals:
+        # (round 7, finding 1)' \
+    '    if False:  # MUTANT
+        # (round 7, finding 1)' \
+    'test_a_running_thread_that_does_not_block_sigterm_means_the_lab_is_refused_before_any_claim'
+
+add "C2R7-1b. the thread check leaves SIGHUP out" \
+    "$LABPY" \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS}' \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS if s != signal.SIGHUP}  # MUTANT' \
+    'test_a_running_thread_that_does_not_block_sighup_is_refused_too'
+
+add "C2R7-1c. the thread check leaves SIGINT out" \
+    "$LABPY" \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS}' \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS if s != signal.SIGINT}  # MUTANT' \
+    'test_a_running_thread_that_does_not_block_sigint_is_refused_too'
+
+add "C2R7-1d. the thread check leaves SIGTERM out" \
+    "$LABPY" \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS}' \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS if s != signal.SIGTERM}  # MUTANT' \
+    'test_a_running_thread_that_does_not_block_sigterm_means_the_lab_is_refused_before_any_claim'
+
+add "C2R7-1e. the calling thread is judged like the others" \
+    "$LABPY" \
+    '        if tid == me:' \
+    '        if False:  # MUTANT' \
+    'test_the_calling_thread_is_not_judged_and_threads_that_block_all_three_signals_pass'
+
+add "C2R7-1f. a /proc that cannot be listed passes" \
+    "$LABPY" \
+    '    except OSError as exc:
+        return ("refused: cannot tell whether' \
+    '    except OSError as exc:
+        return ""  # MUTANT
+        return ("refused: cannot tell whether' \
+    'test_a_proc_that_cannot_be_read_is_a_refusal_not_a_pass'
+
+add "C2R7-1g. a thread whose mask cannot be read passes" \
+    "$LABPY" \
+    '            unreadable.append("thread %s (%s: %s)" % (tid, type(exc).__name__, exc))' \
+    '            pass  # MUTANT' \
+    'test_a_thread_whose_status_cannot_be_read_or_has_no_sigblk_line_is_a_refusal'
+
+add "C2R7-1h. only the first thread that can take a stop is named" \
+    "$LABPY" \
+    '        if missing:
+            bad.append(' \
+    '        if missing and not bad:  # MUTANT
+            bad.append(' \
+    'test_every_thread_that_does_not_block_them_is_named'
+
+add "C2R7-1i. a thread that blocks only part of the three passes when it blocks any of them" \
+    "$LABPY" \
+    '        missing = [s.name for s, bit in _STOP_BITS.items() if not blk & bit]' \
+    '        missing = [] if blk & sum(_STOP_BITS.values()) else [s.name for s, bit in _STOP_BITS.items()]  # MUTANT' \
+    'test_a_thread_with_only_two_of_the_three_bits_set_is_named_in_the_refusal'
+
+add "C2R7-1j. the refusal is written down and the run goes on" \
+    "$LABPY" \
+    '            log("  " + refusal)
+            prepared = None' \
+    '            log("  " + refusal)  # MUTANT' \
+    'test_a_running_thread_that_does_not_block_sigterm_means_the_lab_is_refused_before_any_claim'
+
+add "C2R7-1k. the ValueSet trial runs without the stops blocked" \
+    "$S0PY" \
+    '            with stops_held():
+                results = [VT.trial(' \
+    '            if True:  # MUTANT
+                results = [VT.trial(' \
+    'test_the_valueset_trial_is_entered_with_the_three_stop_signals_blocked_and_the_mask_is_put_back'
+
+add "C2R7-1l. the trial block does not block" \
+    "$S0PY" \
+    '    held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)' \
+    '    held = signal.pthread_sigmask(signal.SIG_BLOCK, ())  # MUTANT' \
+    'test_the_valueset_trial_is_entered_with_the_three_stop_signals_blocked_and_the_mask_is_put_back'
+
+add "C2R7-1m. the trial block leaves SIGHUP out" \
+    "$S0PY" \
+    'STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)' \
+    'STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)  # MUTANT' \
+    'test_the_valueset_trial_is_entered_with_the_three_stop_signals_blocked_and_the_mask_is_put_back'
+
+add "C2R7-1n. the trial block is never lifted" \
+    "$S0PY" \
+    '        signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    '        pass  # MUTANT' \
+    'test_the_valueset_trial_is_entered_with_the_three_stop_signals_blocked_and_the_mask_is_put_back'
+
+add "C2R7-1o. the trial block is lifted only when the trial does not raise" \
+    "$S0PY" \
+    '    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    '    yield  # MUTANT
+    signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    'test_the_mask_is_put_back_when_the_trial_raises_and_the_failure_is_still_recorded'
+
+add "C2R7-1p. a throwaway switch keeps the blocked stops" \
+    "$THROWAWAY" \
+    '    signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGTERM, signal.SIGINT, signal.SIGHUP))' \
+    '    pass  # MUTANT' \
+    'test_a_throwaway_switch_does_not_inherit_the_blocked_stops'
+
+add "C2R7-1q. a throwaway switch is given back only SIGHUP and SIGINT" \
+    "$THROWAWAY" \
+    '    signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGTERM, signal.SIGINT, signal.SIGHUP))' \
+    '    signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGHUP))  # MUTANT' \
+    'test_a_throwaway_switch_does_not_inherit_the_blocked_stops'
+
+add "C2R7-1r. a stop during the trial is dropped, not held" \
+    "$S0PY" \
+    '    held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    '    held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        yield
+    finally:
+        for sig in STOP_SIGNALS:  # MUTANT
+            signal.sigtimedwait([sig], 0)
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    'test_a_stop_that_arrives_during_the_trial_waits_and_is_delivered_when_the_mask_is_put_back'
+
+
 CTRL_SRC="$TABLE"
 CTRL_ANCHOR='def g1_holds(g1):'
 CTRL_REPL='# MUTANT: a comment, and nothing else.

@@ -321,9 +321,11 @@ class LabRound(object):
         meanwhile stays pending and is delivered, when the mask is put back, to whatever handler is then
         installed. Chosen over re-checking `teardown_signal` after the restore because it leaves no window to
         reason about (a re-check has its own gap after the check) and the stop reaches the run-level handler,
-        which ends the run, instead of being folded into a record that was already final. The probe has no
-        threads (nothing under tools/p4_health imports threading), so masking the main thread masks the
-        process."""
+        which ends the run, instead of being folded into a record that was already final. The probe's own code
+        starts no threads, but the process may have some: the ValueSet trial runs gRPC in it, and those threads
+        inherit a block from s0.stops_held. So lab.run_lab refuses to start the lab while any other thread of the
+        process can take one of the three (it reads every thread's SigBlk), and masking the calling thread is then
+        masking the process."""
         if not self.install_signals:
             yield
             return

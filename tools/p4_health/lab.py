@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import signal
+import threading
 
 from . import attribution as AT
 from . import expected as E
@@ -121,6 +122,51 @@ def signalled(rec):
 
 
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+#: Where this process lists its threads. Tests point it at a stand-in tree.
+PROC_TASK = "/proc/self/task"
+_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS}
+
+
+def stop_signal_threads_refusal():
+    """(Cut 2 round 7, finding 1) "" when every thread of this process other than the calling one blocks SIGTERM, SIGINT
+    and SIGHUP, else the sentence that says why the lab must not be touched.
+
+    The round's mask (lab_round.LabRound._masked) blocks the three in the calling thread only. A stop sent to the
+    process meanwhile goes to a thread that does not block it, and Python then runs the handler in the main thread,
+    inside the masked region, where it is still the teardown's noter: nothing reads it again and the next bring-up is
+    claimed over it. So no other thread may be able to take one. Each thread's mask is read from
+    <PROC_TASK>/<tid>/status (SigBlk). A thread that cannot be read, or a /proc that cannot, is a refusal: this
+    cannot be shown, so it is not assumed."""
+    try:
+        tids = sorted(os.listdir(PROC_TASK), key=lambda t: (len(t), t))
+    except OSError as exc:
+        return ("refused: cannot tell whether a thread of this process can take a stop signal (%s: %s); the lab is "
+                "not touched" % (PROC_TASK, exc))
+    me = str(threading.get_native_id())
+    bad, unreadable = [], []
+    for tid in tids:
+        if tid == me:
+            continue
+        path = os.path.join(PROC_TASK, tid, "status")
+        try:
+            with open(path, encoding="ascii", errors="replace") as fh:
+                lines = fh.read().splitlines()
+            blk = int([l for l in lines if l.startswith("SigBlk:")][0].split()[1], 16)
+        except (OSError, IndexError, ValueError) as exc:
+            if not os.path.isdir(os.path.join(PROC_TASK, tid)):
+                continue                            # the thread ended while the list was being read
+            unreadable.append("thread %s (%s: %s)" % (tid, type(exc).__name__, exc))
+            continue
+        missing = [s.name for s, bit in _STOP_BITS.items() if not blk & bit]
+        if missing:
+            bad.append("thread %s does not block %s" % (tid, ", ".join(missing)))
+    if not (bad or unreadable):
+        return ""
+    why = "; ".join(bad + ["cannot read the signal mask of " + u for u in unreadable])
+    return ("refused: %s. A stop signal could be delivered to such a thread while a round's mask is up and be lost, "
+            "with the next bring-up claimed over it; the lab is not touched" % why)
 
 
 def _swap_handlers(handlers):
@@ -227,6 +273,14 @@ def run_lab(cfg, runner, s0_out, run_dir, run_id, bringups=("A", "B"), only=None
         except Exception as exc:  # noqa: BLE001 -- a run that cannot be set up is INCOMPLETE, with the reason
             problems.append("the run could not be set up: %s: %s" % (type(exc).__name__, exc))
             log("  " + problems[-1])
+    if prepared is not None and signals:
+        # (round 7, finding 1) before the first lab action: a thread that can take a stop makes the round's mask
+        # worth nothing, so the lab is not touched
+        refusal = stop_signal_threads_refusal()
+        if refusal:
+            problems.append(refusal)
+            log("  " + refusal)
+            prepared = None
     if prepared is not None:
         model, pipelines, runtimes, orders = prepared
         packages = os.path.join(run_dir, "packages")

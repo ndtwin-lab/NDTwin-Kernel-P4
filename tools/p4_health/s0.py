@@ -13,11 +13,13 @@ the Runner does not wrap (a long-lived child stopped by its pid): see throwaway.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 
 from . import frames as F
 from . import frozen as FZ
@@ -145,6 +147,26 @@ def show_ports_ok(parsed, data_ports=(1, 2, 3), cpu_port=510):
     """show_ports of a switch given `data_ports` as -i and `cpu_port` as --cpu-port: exactly the
     data ports, with the CPU port allowed beside them (fabric_view skips it)."""
     return parsed is not None and set(parsed) - {cpu_port} == set(data_ports)
+
+
+#: The signals a stop arrives as (lab_round.LabRound.SIGS, lab.STOP_SIGNALS).
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+@contextlib.contextmanager
+def stops_held():
+    """(Cut 2 round 7, finding 1) SIGTERM, SIGINT and SIGHUP blocked in the calling thread for the body of the `with`,
+    and the mask that was there put back afterwards, an exception included. A thread inherits the mask of the thread
+    that starts it, so every thread gRPC starts inside the body blocks the three for good; a lab round's own mask
+    (lab_round.LabRound._masked) covers the calling thread only, and `lab.run_lab` refuses to start the lab while a
+    thread of this process can take a stop. A stop that arrives meanwhile stays pending and is delivered, to
+    whatever handler is in place, when the mask is put back (S0 has none of its own: the default action ends the
+    process, as before, after the trial rather than in the middle of it)."""
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
 
 
 def preflight_rows(stdout):
@@ -570,9 +592,12 @@ class S0(object):
         """VS1's Cut 2 safety question (review MAJ-8), asked of throwaway simple_switch_grpc."""
         try:
             from . import vs_trial as VT
-            results = [VT.trial(os.path.join(self.ex, "build"), b, self.thrift_cli,
-                                os.path.join(self.run_dir, "vs_trial_work"))
-                       for b in ("/usr/local/bin/simple_switch_grpc", VT.fabric_binary())]
+            # (round 7, finding 1) the trial runs gRPC in this process, and the threads gRPC starts must not be
+            # able to take a stop: see stops_held
+            with stops_held():
+                results = [VT.trial(os.path.join(self.ex, "build"), b, self.thrift_cli,
+                                    os.path.join(self.run_dir, "vs_trial_work"))
+                           for b in ("/usr/local/bin/simple_switch_grpc", VT.fabric_binary())]
         except Exception as exc:  # noqa: BLE001
             self.check("ValueSetEntry trial on throwaway simple_switch_grpc", False,
                        "%s: %s" % (type(exc).__name__, exc))
