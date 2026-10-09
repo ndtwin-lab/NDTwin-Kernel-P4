@@ -3255,6 +3255,49 @@ add "C2R7-1r. a stop during the trial is dropped, not held" \
     'test_a_stop_that_arrives_during_the_trial_waits_and_is_delivered_when_the_mask_is_put_back'
 
 
+# finding 4: the exercise copy is checked again right before lab.load_model runs it
+add "C2R7-3a. run_lab does not check the exercise copy again before loading the model" \
+    "$LABPY" \
+    '            if getattr(frozen, "head", None):
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    '            if False:  # MUTANT
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    'test_a_convert_that_appends_to_the_exercise_copys_gen_runtime_is_refused_before_load_model_runs_it'
+
+add "C2R7-3b. the exercise copy is checked after the model was loaded from it" \
+    "$LABPY" \
+    '            if getattr(frozen, "head", None):
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))
+            model = load_model(os.path.join(run_dir, "exercise"))' \
+    '            model = load_model(os.path.join(run_dir, "exercise"))  # MUTANT
+            if getattr(frozen, "head", None):
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    'test_a_convert_that_appends_to_the_exercise_copys_gen_runtime_is_refused_before_load_model_runs_it'
+
+add "C2R7-3c. the re-check is made without a pinned commit to check against" \
+    "$LABPY" \
+    '            if getattr(frozen, "head", None):
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    '            if True:  # MUTANT
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    'test_a_then_b_then_the_verdicts'
+
+add "C2R7-3d. the re-check looks at the run directory, not the exercise copy" \
+    "$LABPY" \
+    '                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    '                frozen.check_exercise(run_dir)  # MUTANT' \
+    'test_a_convert_that_leaves_the_exercise_copy_alone_goes_on_to_the_rounds'
+
+add "C2R7-3e. a refused exercise copy is let through" \
+    "$LABPY" \
+    '                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    '                try:
+                    frozen.check_exercise(os.path.join(run_dir, "exercise"))
+                except FZ.Refused:  # MUTANT
+                    pass' \
+    'test_a_convert_that_adds_a_file_to_the_exercise_copy_is_refused_before_load_model_too'
+
+
 CTRL_SRC="$TABLE"
 CTRL_ANCHOR='def g1_holds(g1):'
 CTRL_REPL='# MUTANT: a comment, and nothing else.

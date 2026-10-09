@@ -26,6 +26,8 @@ a 15-minute run, and `probe.py lab` checked it clean only once, so:
   * (round 6) S0's copy of tools/p4_health/exercise/ -- the model every expectation, the controller trial and
     lab.load_model go by -- is checked the same way against the pinned commit (Frozen.check_exercise, right
     after S0's compile_all): a file that differs, is missing or is not in the commit is refused.
+  * (round 7) and once more immediately before lab.load_model runs gen_runtime.py from it: in between, S0 hands the
+    copy to convert.py as its input, and the check is what shows that convert.py did not write into it.
 """
 from __future__ import annotations
 

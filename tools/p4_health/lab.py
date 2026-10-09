@@ -267,6 +267,12 @@ def run_lab(cfg, runner, s0_out, run_dir, run_id, bringups=("A", "B"), only=None
         log(problems[-1])
     else:
         try:
+            # (round 7, finding 4) S0 checked its copy of exercise/ once, right after compile_all, and then handed
+            # it to the shared tree's convert.py as its input: a convert.py that wrote into it would have its
+            # gen_runtime.py run here. Checked again, against the same pinned commit, immediately before it is
+            # loaded. This is before any claim: a refusal is this run's ordinary "could not be set up".
+            if getattr(frozen, "head", None):
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))
             model = load_model(os.path.join(run_dir, "exercise"))
             pipelines, runtimes, orders = expectations(s0_out, run_dir, model)
             prepared = (model, pipelines, runtimes, orders)
