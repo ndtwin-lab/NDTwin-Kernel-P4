@@ -1729,6 +1729,143 @@ class TestS0Cut2Checks(unittest.TestCase):
                          "/tutorials/utils")
         self.assertEqual(seen, [510])
 
+    # --- round 7, finding 1: the ValueSet trial runs gRPC in this process; the threads it starts must block the stops --
+    def stops(self):
+        import signal
+        return (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+    def run_vs_trial_with(self, trial):
+        """S0.vs_trial with VT.trial replaced by `trial`. Returns the S0."""
+        from unittest import mock
+        x, _r = self.s0([])
+        with mock.patch("p4_health.vs_trial.trial", trial), \
+                mock.patch("p4_health.vs_trial.fabric_binary", return_value="/y/bin/simple_switch_grpc"):
+            x.vs_trial()
+        return x
+
+    def test_the_valueset_trial_is_entered_with_the_three_stop_signals_blocked_and_the_mask_is_put_back(self):
+        import signal
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        inside = []
+
+        def trial(build, bmv2, cli, work):
+            inside.append(signal.pthread_sigmask(signal.SIG_BLOCK, ()))
+            return {"bmv2": bmv2, "alive_after_write": True, "alive_after_read": True, "write_errors": [{"canonical_code": 12}]}
+        self.run_vs_trial_with(trial)
+        self.assertEqual(len(inside), 2)                    # the stock build and the fabric's
+        for mask in inside:
+            self.assertTrue(set(self.stops()) <= set(mask), mask)
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, ()), before)
+
+    def test_the_mask_is_put_back_when_the_trial_raises_and_the_failure_is_still_recorded(self):
+        import signal
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        inside = []
+
+        def trial(build, bmv2, cli, work):
+            inside.append(signal.pthread_sigmask(signal.SIG_BLOCK, ()))
+            raise RuntimeError("the trial broke")
+        x = self.run_vs_trial_with(trial)
+        self.assertTrue(inside and set(self.stops()) <= set(inside[0]))
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, ()), before)
+        self.assertFalse(x.out["checks"][-1]["ok"])
+        self.assertIn("the trial broke", x.out["checks"][-1]["detail"])
+
+    def test_a_thread_started_inside_the_trial_blocks_the_three_stop_signals(self):
+        """What gRPC does inside the trial: starts threads that outlive it. A thread inherits the mask of the
+        thread that starts it, so it blocks the stops for good; one started outside the trial would not."""
+        import threading
+        kept, stop = [], threading.Event()
+        self.addCleanup(lambda: [stop.set()] + [t.join(10) for t in kept])
+
+        def trial(build, bmv2, cli, work):
+            t = threading.Thread(target=stop.wait, args=(120,), daemon=True)
+            t.start()
+            kept.append(t)
+            return {"bmv2": bmv2, "alive_after_write": True, "alive_after_read": True, "write_errors": [{"canonical_code": 12}]}
+        self.run_vs_trial_with(trial)
+        self.assertTrue(kept)
+        for t in kept:
+            with open("/proc/self/task/%d/status" % t.native_id) as fh:
+                blk = int([l for l in fh if l.startswith("SigBlk:")][0].split()[1], 16)
+            for s in self.stops():
+                self.assertTrue(blk & (1 << (s - 1)), "%s is not blocked in thread %d (SigBlk %x)" % (s.name, t.native_id, blk))
+
+    def test_a_stop_that_arrives_during_the_trial_waits_and_is_delivered_when_the_mask_is_put_back(self):
+        import signal
+        in_trial, seen_inside, seen_after = [True], [], []
+        old = {s: signal.signal(s, lambda n, f: (seen_inside if in_trial[0] else seen_after).append(n))
+               for s in self.stops()}
+
+        def trial(build, bmv2, cli, work):
+            in_trial[0] = True
+            for s in self.stops():
+                os.kill(os.getpid(), s)
+            for _ in range(2000):
+                pass                                        # the handlers would run here, if they could
+            in_trial[0] = False
+            return {"bmv2": bmv2, "alive_after_write": True, "alive_after_read": True, "write_errors": [{"canonical_code": 12}]}
+        try:
+            self.run_vs_trial_with(trial)
+            for _ in range(2000):
+                pass
+        finally:
+            for s, h in old.items():
+                signal.signal(s, h)
+        self.assertEqual(seen_inside, [])
+        # delivered once the trial is over (the first call's stops arrive when the mask is put back after both
+        # calls: the mask covers the whole trial), none lost
+        self.assertEqual(sorted(set(seen_after)), sorted(int(s) for s in self.stops()))
+
+    def test_a_stop_during_the_trial_ends_an_unhandled_process_only_after_the_trial_is_over(self):
+        """The S0 stage has no handler of its own: a SIGTERM kills the process. During the trial it must wait for the
+        trial to finish (a trial killed in the middle leaves its throwaway switch to the parent-death signal), and
+        then kill it all the same -- the stop is held, not dropped."""
+        import tempfile
+        d = tempfile.mkdtemp(prefix="p4h-vs-stop-%d-" % os.getpid())
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        tools = os.path.dirname(os.path.dirname(PKG))
+        code = (
+            "import os, signal, sys\n"
+            "from unittest import mock\n"
+            "sys.path.insert(0, %r)\n"
+            "from p4_health import s0 as S0M\n"
+            "from p4_health.collect.runner import RecordingRunner\n"
+            "def trial(build, bmv2, cli, work):\n"
+            "    os.kill(os.getpid(), signal.SIGTERM)\n"
+            "    for _ in range(200000):\n"
+            "        pass\n"
+            "    open(%r, 'w').write('the trial ran to its end')\n"
+            "    return {'bmv2': bmv2, 'alive_after_write': True, 'alive_after_read': True,\n"
+            "            'write_errors': [{'canonical_code': 12}]}\n"
+            "x = S0M.S0(%r, RecordingRunner([]), 'py', log=lambda *a: None)\n"
+            "with mock.patch('p4_health.vs_trial.trial', trial), \\\n"
+            "        mock.patch('p4_health.vs_trial.fabric_binary', return_value='/y/b'):\n"
+            "    x.vs_trial()\n"
+            "open(%r, 'w').write('the process outlived the stop')\n"
+            % (tools, os.path.join(d, "inside"), d, os.path.join(d, "after")))
+        res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+        import signal
+        self.assertEqual(res.returncode, -signal.SIGTERM, res.stderr[-800:])
+        self.assertTrue(os.path.exists(os.path.join(d, "inside")), "the stop killed the trial in the middle")
+        self.assertFalse(os.path.exists(os.path.join(d, "after")))
+
+    def test_a_throwaway_switch_does_not_inherit_the_blocked_stops(self):
+        """The mask is inherited across exec: a switch started inside the trial with SIGTERM blocked would ignore
+        Throwaway.stop()'s terminate() and be killed only after its 3 s timeout. The child clears the three before exec."""
+        import signal
+        from p4_health import throwaway as TW
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, self.stops())
+        try:
+            proc = subprocess.run([sys.executable, "-c", "print([l for l in open('/proc/self/status') if l.startswith('SigBlk')][0])"],
+                                  capture_output=True, text=True, timeout=60, preexec_fn=TW._die_with_parent)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        blk = int(proc.stdout.split()[1], 16)
+        for s in self.stops():
+            self.assertFalse(blk & (1 << (s - 1)), "%s is still blocked in the child (SigBlk %x)" % (s.name, blk))
+
 
 class TestTheLiveRunsIdentity(unittest.TestCase):
     """m4: a lab run refuses a dirty probe, and records the Q6(a) fingerprint and the system

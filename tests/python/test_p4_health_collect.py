@@ -3246,6 +3246,161 @@ class TestTheLabRun(Cut2):
         self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
         self.assertTrue(any("stop signal" in p_ for p_ in doc["problems"]), doc["problems"])
 
+    # --- round 7, finding 1: the mask holds only in the calling thread, so no other thread may take a stop --------
+    def background_thread(self, blocked):
+        """A thread that stays up for the rest of the test, started with the signals in `blocked` blocked in it (a
+        thread inherits the mask of the thread that starts it); the caller's own mask is put back as soon as it is
+        up. Returns the Thread."""
+        import threading
+        up, stop = threading.Event(), threading.Event()
+
+        def work():
+            up.set()
+            stop.wait(120)
+        old = signal.pthread_sigmask(signal.SIG_SETMASK, set(blocked))
+        try:
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+            self.assertTrue(up.wait(10))
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+        self.addCleanup(t.join, 10)
+        self.addCleanup(stop.set)
+        return t
+
+    def lab_with_a_stop_in_finish(self, signum):
+        """The finish-hook test's run, for any of the three stop signals: `signum` comes from a hook inside A's
+        `_finish`, after it read teardown_signal. Returns (rc, doc, runner, what the safety handlers saw)."""
+        import select
+        seen = []
+        safety = {s: signal.signal(s, lambda n, f: seen.append(n)) for s in LAB.STOP_SIGNALS}
+        proc = self.proc
+        # The C-level handler writes the signal's number to the wakeup fd when it runs, in whichever thread the
+        # kernel gave the signal to. Without waiting for it the main thread usually gets through the rest of
+        # `_finish` and the restore before a sleeping thread has been scheduled, and the old code is only
+        # sometimes wrong. A signal held pending (every thread blocks it) never writes: that wait times out.
+        rd, wr = os.pipe()
+        os.set_blocking(rd, False)
+        os.set_blocking(wr, False)
+        old_wakeup = signal.set_wakeup_fd(wr, warn_on_full_buffer=False)
+
+        def make(cfg, runner, bringup, pkg, run_id):
+            class Hooked(LR.LabRound):
+                def _finish(self, rec, t0):
+                    LR.LabRound._finish(self, rec, t0)
+                    if bringup == "A":
+                        os.kill(os.getpid(), signum)
+                        select.select([rd], [], [], 0.5)
+            return Hooked(cfg, runner, bringup, pkg, run_id, pid=4242, proc_root=proc, install_signals=True)
+        r = self.ndt_runner()
+        try:
+            rc, doc = LAB.run_lab(self.cfg, r, self.s0, self.cfg.run_dir, "run-x", round_cls=make,
+                                  tutorials_utils="/tutorials/utils", expected_tsv=self.expected,
+                                  b_kwargs=self.fake_time(), log=lambda *a: None)
+        finally:
+            signal.set_wakeup_fd(old_wakeup)
+            os.close(rd)
+            os.close(wr)
+            for s, h in safety.items():
+                signal.signal(s, h)
+        return rc, doc, r, seen
+
+    def assert_refused_before_any_lab_action(self, rc, doc, r, seen, *needles):
+        claims = [c for c in r.calls if c["argv"][:2] == ["ndt", "claim"]]
+        self.assertEqual(claims, [], "the lab was claimed %d time(s) (bring-ups %s; problems %s) although a thread "
+                                     "could take a stop" % (len(claims), [b["id"] for b in doc["bringups"]],
+                                                            doc["problems"]))
+        self.assertEqual([c["argv"] for c in r.calls if c["argv"][0] == "ndt"], [])
+        self.assertEqual(seen, [])
+        self.assertEqual(doc["bringups"], [])
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        self.assertFalse(os.path.exists(self.cfg.lab_state_path), "something was written for the lab")
+        text = " | ".join(doc["problems"])
+        for n in needles:
+            self.assertIn(n, text)
+
+    def test_a_running_thread_that_does_not_block_sigterm_means_the_lab_is_refused_before_any_claim(self):
+        """(Finding 1) The round's mask blocks the three stop signals in the calling thread only. A stop sent to
+        the process while that mask is up goes to a thread that does not block it, and Python then runs the
+        handler in the main thread, inside the masked region, where it is still the teardown's noter: the stop
+        was read by nothing and B was claimed. The finish-hook test with one extra running thread: run_lab now
+        refuses before it claims, and names the thread."""
+        t = self.background_thread(blocked=())
+        rc, doc, r, seen = self.lab_with_a_stop_in_finish(signal.SIGTERM)
+        self.assert_refused_before_any_lab_action(rc, doc, r, seen, "thread %d" % t.native_id, "SIGTERM")
+
+    def test_a_running_thread_that_does_not_block_sighup_is_refused_too(self):
+        t = self.background_thread(blocked=(signal.SIGTERM, signal.SIGINT))
+        rc, doc, r, seen = self.lab_with_a_stop_in_finish(signal.SIGHUP)
+        self.assert_refused_before_any_lab_action(rc, doc, r, seen, "thread %d" % t.native_id, "SIGHUP")
+
+    def test_a_running_thread_that_does_not_block_sigint_is_refused_too(self):
+        t = self.background_thread(blocked=(signal.SIGTERM, signal.SIGHUP))
+        rc, doc, r, seen = self.lab_with_a_stop_in_finish(signal.SIGINT)
+        self.assert_refused_before_any_lab_action(rc, doc, r, seen, "thread %d" % t.native_id, "SIGINT")
+
+    def test_a_running_thread_started_with_the_three_signals_blocked_does_not_stop_the_run_or_lose_the_stop(self):
+        """The control of the tests above: the same thread, started while the three signals were blocked (as the
+        threads gRPC starts inside the ValueSet trial are). The lab is claimed for A, the stop from the hook is
+        delivered when the round's mask lifts, and B is not claimed over it."""
+        self.background_thread(blocked=LAB.STOP_SIGNALS)
+        rc, doc, r, seen = self.lab_with_a_stop_in_finish(signal.SIGTERM)
+        claims = [c for c in r.calls if c["argv"][:2] == ["ndt", "claim"]]
+        self.assertEqual(len(claims), 1, "B was claimed over the stop, or A was refused")
+        self.assertEqual(seen, [])
+        self.assertEqual([b["id"] for b in doc["bringups"]], ["A"])
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        self.assertTrue(any("stop signal" in p_ for p_ in doc["problems"]), doc["problems"])
+        self.assertFalse(any("refused" in p_ for p_ in doc["problems"]), doc["problems"])
+
+    def fake_tasks(self, threads):
+        """A stand-in for /proc/self/task: {tid: the status file's text, or None for a thread with no status file}."""
+        import threading
+        top = os.path.join(self.tmp, "fake-task")
+        shutil.rmtree(top, ignore_errors=True)
+        os.makedirs(top)
+        threads = dict(threads)
+        threads.setdefault(threading.get_native_id(), "Name:\tmain\nSigBlk:\t0000000000000000\n")
+        for tid, text in threads.items():
+            os.makedirs(os.path.join(top, str(tid)))
+            if text is not None:
+                with open(os.path.join(top, str(tid), "status"), "w") as fh:
+                    fh.write(text)
+        return top
+
+    ALL_THREE = "Name:\tw\nSigBlk:\t0000000000004003\n"
+
+    def test_the_calling_thread_is_not_judged_and_threads_that_block_all_three_signals_pass(self):
+        top = self.fake_tasks({910001: self.ALL_THREE, 910002: "Name:\tw\nSigBlk:\tffffffffffffffff\n"})
+        with mock.patch.object(LAB, "PROC_TASK", top):
+            rc, doc, r = self.run_lab()
+        self.assertEqual((doc["verdict"], rc), ("COMPLETE", 0))
+
+    def test_a_thread_with_only_two_of_the_three_bits_set_is_named_in_the_refusal(self):
+        top = self.fake_tasks({910001: self.ALL_THREE, 910002: "Name:\tw\nSigBlk:\t0000000000000003\n"})
+        with mock.patch.object(LAB, "PROC_TASK", top):
+            rc, doc, r = self.run_lab()
+        self.assert_refused_before_any_lab_action(rc, doc, r, [], "910002", "SIGTERM")
+        self.assertNotIn("910001", " ".join(doc["problems"]))
+
+    def test_every_thread_that_does_not_block_them_is_named(self):
+        top = self.fake_tasks({910001: "Name:\tw\nSigBlk:\t0000000000000000\n", 910002: "Name:\tw\nSigBlk:\t0000000000004002\n"})
+        with mock.patch.object(LAB, "PROC_TASK", top):
+            rc, doc, r = self.run_lab()
+        self.assert_refused_before_any_lab_action(rc, doc, r, [], "910001", "910002")
+
+    def test_a_proc_that_cannot_be_read_is_a_refusal_not_a_pass(self):
+        with mock.patch.object(LAB, "PROC_TASK", os.path.join(self.tmp, "no-such-proc", "task")):
+            rc, doc, r = self.run_lab()
+        self.assert_refused_before_any_lab_action(rc, doc, r, [], "no-such-proc")
+
+    def test_a_thread_whose_status_cannot_be_read_or_has_no_sigblk_line_is_a_refusal(self):
+        for text in (None, "Name:\tw\nState:\tS (sleeping)\n", "Name:\tw\nSigBlk:\tnot-hex\n"):
+            top = self.fake_tasks({910003: text})
+            with mock.patch.object(LAB, "PROC_TASK", top):
+                rc, doc, r = self.run_lab()
+            self.assert_refused_before_any_lab_action(rc, doc, r, [], "910003")
+
     def test_a_round_cut_off_before_its_record_was_finished_is_not_complete_in_health_json(self):
         """(Finding 4, the NIT) A first stop between the end of the body and the swap in `_handlers(False)`
         raises inside the `finally`: the teardown and `_finish` never run, and the record lab.py takes still
