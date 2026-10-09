@@ -2920,7 +2920,7 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         "edit = os.environ.get('FAKE_CONVERT_EDIT', '')\n"
         "if edit == 'append':\n"
         "    with open(os.path.join(exercise, 'gen_runtime.py'), 'a') as fh:\n"
-        "        fh.write('\\nEDITED_BY_CONVERT = True\\n')\n"
+        "        fh.write('\\nEDITED_BY_CONVERT = True\\nimport builtins\\nbuiltins.EDITED_BY_CONVERT_RAN = True\\n')\n"
         "elif edit == 'add':\n"
         "    with open(os.path.join(exercise, 'extra_model.py'), 'w') as fh:\n"
         "        fh.write('# written by convert\\n')\n"
@@ -2940,6 +2940,8 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         from p4_health import s0 as S0M
         from p4_health.collect.config import Config
         from p4_health.collect.runner import RecordingRunner, Runner
+        import builtins
+        self.addCleanup(lambda: hasattr(builtins, "EDITED_BY_CONVERT_RAN") and delattr(builtins, "EDITED_BY_CONVERT_RAN"))
         fz, copy = self.freeze_with_exercise()
         run_dir = os.path.dirname(copy)
         script = os.path.join(run_dir, "fake_convert.py")
@@ -2971,7 +2973,10 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         convert.py as its input, and lab.load_model runs gen_runtime.py from it much later. A convert.py that
         wrote into its input was run, not refused. load_model is before any claim, so the refusal is the run's
         ordinary 'could not be set up': INCOMPLETE, rc 2, nothing started, and the record says which file."""
+        import builtins
         rc, doc, models, rounds, calls, fz = self.run_lab_after_a_convert_that("append")
+        # the edited file must not even have been executed: a check made after load_model came too late
+        self.assertFalse(hasattr(builtins, "EDITED_BY_CONVERT_RAN"), "the edited gen_runtime.py was executed")
         self.assertEqual(models, [], "the edited gen_runtime.py was loaded: %r" % [
             getattr(m, "EDITED_BY_CONVERT", None) for m in models])
         self.assertEqual((rounds, calls), (0, []))
