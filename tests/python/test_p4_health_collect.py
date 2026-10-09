@@ -3396,6 +3396,7 @@ class TestTheLabRun(Cut2):
 
     def test_a_thread_whose_status_cannot_be_read_or_has_no_sigblk_line_is_a_refusal(self):
         for text in (None, "Name:\tw\nState:\tS (sleeping)\n", "Name:\tw\nSigBlk:\tnot-hex\n"):
+            shutil.rmtree(os.path.join(self.cfg.run_dir, "frozen"), ignore_errors=True)     # a freeze writes only what is new
             top = self.fake_tasks({910003: text})
             with mock.patch.object(LAB, "PROC_TASK", top):
                 rc, doc, r = self.run_lab()
