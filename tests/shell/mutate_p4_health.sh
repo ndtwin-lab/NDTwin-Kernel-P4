@@ -2508,7 +2508,7 @@ add "C2R5-10b. the record is finished after the run-level handlers are back" \
                     self._restore_handlers()' \
     '                    self._restore_handlers()
                     self._finish(rec, t0)  # MUTANT' \
-    'test_a_stop_just_after_a_rounds_handlers_are_restored_keeps_that_rounds_record'
+    'test_an_exception_after_a_rounds_record_is_final_keeps_that_rounds_record'
 
 add "C2R5-10c. a stop between a round and its record being appended loses the record" \
     "$LABPY" \
