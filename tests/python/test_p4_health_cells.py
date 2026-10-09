@@ -2967,9 +2967,15 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         """The freeze pinned HEAD only after the modules were loaded and the tree checked: a commit to
         tools/p4_health in that one second made frozen_head name a commit the preloaded modules were not read
         from. HEAD is pinned first; if it has moved when the clean check is done, the run is refused."""
-        hook = self.commit_once(lambda a: a[:3] == ("rev-parse", "--verify", "HEAD"))
+        # (round 7, finding 3) The commit is to lab.py: a module the run has loaded but does not freeze. frames.py,
+        # which this test used to commit, is one of the frozen files, so the freeze refused the change by itself
+        # and the re-check of HEAD was only seen in its message. Here, without the re-check, the run reaches S0 with
+        # frozen_head naming a commit its modules were not read from; the behavioural assertion is the first one.
+        hook = self.commit_once(lambda a: a[:3] == ("rev-parse", "--verify", "HEAD"),
+                                rel=("tools", "p4_health", "lab.py"))
         rc, frozen, err, _start, _repo = self.lab_pinned(hook)
-        self.assertEqual((rc, frozen), (2, None))
+        self.assertEqual((rc, frozen), (2, None), "the run went on to S0 on a HEAD that is not the one its modules "
+                                                  "were read from")
         self.assertIn("refused:", err)
         self.assertIn("HEAD moved", err)
         self.assertNotIn("Traceback", err)
