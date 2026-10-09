@@ -76,7 +76,8 @@
 
 - **前置**：`probe.py lab` 在 `tools/p4_health` 有任何未提交的改動時拒絕（rc 2）。
   - 凍結（第 4 輪起，第 5 輪改過）：乾淨檢查之後、S0 之前，立刻把各輪會執行的 7 個檔（root 3 個、B 4 個，`frozen.py:36-38`）複製進 `<run>/frozen/`。HEAD 只問一次（`git rev-parse --verify HEAD`），每個副本用 `git hash-object --no-filters <副本>` 對 `<那個 sha>:tools/<路徑>` 的 blob 逐一比對；對不上、git 答不出、HEAD 釘不住、`<run>/frozen` 已存在、mkdir 失敗，都是 rc 2，什麼 lab 動作都還沒做（`frozen.py:13-24`）。那個 sha 記在 health.json 的 `frozen_head`。（這一條原來寫的是第 4 輪的做法，`git hash-object <副本>` 對 `git rev-parse HEAD:<路徑>`，已過時；r5 審查 #9。）
-  - **凍結只蓋這 7 個檔，不是「這一輪執行的所有東西」**；其餘從共用 tree 執行或讀的，見 §6 前提 3。
+  - **第 6 輪起**：HEAD 在最前面釘一次（先於載入模組與乾淨檢查），乾淨檢查之後再問一次，不一樣就 rc 2（`probe.py cmd_lab`）；凍結拿這個 sha，不再自己問（§10，釘 HEAD 的 NIT）。S0 的 `exercise/` 副本在 `compile_all` 之後用同樣的 `git hash-object --no-filters` 對這個 sha 驗（`frozen.check_tree`），對不上、多一個檔、少一個檔、有連結、git 答不出，都是 rc 2，在任何 lab 動作之前（§10，finding 2）。
+  - **凍結只蓋這 7 個檔，不是「這一輪執行的所有東西」**；`exercise/` 另有上面那道檢查；其餘從共用 tree 執行或讀的，見 §6 前提 3。
   - root 的 `hostside.py`、B 的 controller 與 adapter 都執行副本，不執行共用的 working tree；各檔的 sha256 記在 health.json 的 `frozen_code`（root 那三個另外在 `root_code`）。
 - **S0**：在 run 目錄跑 S0，不是 COMPLETE 就停：第 5 輪起是 **rc 2**（INCOMPLETE），health.json 的 `problems` 寫哪幾個檢查沒過，不碰 lab、不做 identity。（第 4 輪以前是 rc 1、沒有 health.json；rc 1 在 see-red 那一輪是「過」，見 §8。）
 - **記錄這一輪跑的是什麼**：
@@ -180,8 +181,7 @@
   - **前提 3（乾淨檢查與凍結實際蓋到什麼，r5 審查 #2；這一條更正第 4、5 輪的說法）**：
     - 乾淨檢查只蓋 `tools/p4_health`（`git status --porcelain -- tools/p4_health`，`probe.py:155`）。凍結只蓋 7 個檔（`frozen.py:36-38`）：root 的 `hostside.py`、`frames.py`、`__init__.py`，B 的 `controller_ext.py`、`run_external_controller.py`、`common.py`、`__init__.py`。探測器行程自己用到的 `p4_health` 模組，在乾淨檢查之前就載入（`probe.LAB_PATH_MODULES`，`probe.py:49-57`）。
     - **乾淨檢查之後，這一輪還是從共用 tree 讀或執行下面這些；沒有任何一道檢查擋它們，改了就照用**：
-      - `tools/p4_health/exercise/gen_runtime.py`：S0 的 controller trial 在探測器行程內 exec（`ctrl_trial.py:36-41`、`:47`；`s0.py:694` 呼叫，約在檢查後 1–2 分鐘），它供給模型（hosts、routes、runtime）；
-      - `exercise/` 整個目錄：S0 一開始複製一份（`s0.py:185-188`，複製時不核對 HEAD），之後 `s0.py:312-316` 與 `lab.py:34-38` exec 那份副本，所有 T1／PL1 的預期從它來；
+      - （第 6 輪起不在這張清單：`exercise/` 整個目錄——S0 複製的副本現在在 `compile_all` 之後對釘住的 commit 驗過，controller trial 也改讀那份副本，不再 exec 共用 tree 的 `gen_runtime.py`，見 §10 finding 2。）
       - `tools/p4_health/openapi_probe.py`（`s0.py:663`）；
       - `tools/p4_exercise/convert.py`、`preflight.py`（`s0.py:233`、`:275`）；
       - `tools/test_workflow/heartbeat_drop_check.py`（`s0.py:297`）；
@@ -189,11 +189,11 @@
       - live-p1 的 `code_identity.py` 與 `venv_fingerprint.sh`（`probe.py:197-206`；`identity.py:110-112`、`:146-148`）：它們產生 `system_under_test` 和基準指紋的 interpreters 部分。
     - 一個改動什麼時候被擋：
       - 乾淨檢查**之前**、在 `tools/p4_health` 之下：rc 2 拒絕。
-      - 乾淨檢查**之後、凍結之前**：只有凍結的 7 個檔會因為副本對不上 HEAD 的 blob 而 rc 2（`frozen.py`）。**`exercise/**`、`openapi_probe.py` 和上面清單的其他檔不會被拒絕，會被用。**（這一點原來寫成「檢查之後、凍結之前的改動都會被拒絕」，是錯的。）
+      - 乾淨檢查**之後、凍結之前**：凍結的 7 個檔會因為副本對不上釘住的 commit 的 blob 而 rc 2（`frozen.py`）；**第 6 輪起，`exercise/` 的副本也一樣（在 S0 的 `compile_all` 之後驗）。`openapi_probe.py` 和上面清單的其他檔不會被拒絕，會被用。**（第 4、5 輪的文字寫成「檢查之後、凍結之前的改動都會被拒絕」，是錯的；r5 審查 #2。）
       - 乾淨檢查之前、在 `tools/p4_health` 之外（`tools/p4_exercise`、`tools/test_workflow`、live-p1 那兩支）：探測器不查；只有「命令」第 3 行的 `git status` 由人查。
-      - 凍結**之後**：7 個檔與已載入的模組，這一輪執行副本與已載入的碼，結果不受影響；清單裡的其他檔照樣被用，也不會被偵測。`gate_fingerprint` 的 tracked 部分（`repo_tracked`，約第 3 分鐘算）和 `system_under_test` 只記算的那一刻的狀態，之後的改動不在紀錄裡。
-    - **所以原來的兩句是錯的**，已刪：「主 checkout 其他地方別的 session 的未提交改動不影響這一輪」（探測器還執行 `tools/p4_exercise`、`tools/test_workflow`、live-p1 的檔），以及「之後不再從共用 tree 讀 probe 程式」（`gen_runtime.py` 與子行程執行的檔不在其內）。`probe.py:38-47` 的註解也寫了同樣的話，**那段註解對這些檔是錯的**；它是程式，不在這個 commit 改，跟下一輪 code 一起改（§9）。
-    - **程式缺口還開著**（文字補不了）：`ctrl_trial` 讀的是共用 tree 的 `exercise/gen_runtime.py`，不是 `<run>/exercise`；S0 複製 `exercise/` 之後沒有拿它對 `frozen.head` 驗。列在 §9，等下一輪 code。在那之前，靠「命令」第 3 行延伸過的 `git status`，和「跑的期間，這些檔沒有人動」（前提 1 的宣告要把這一點也寫進去）。
+      - 凍結**之後**：7 個檔、`exercise/` 的副本與已載入的模組，這一輪執行副本與已載入的碼，結果不受影響；清單裡的其他檔照樣被用，也不會被偵測。`gate_fingerprint` 的 tracked 部分（`repo_tracked`，約第 3 分鐘算）和 `system_under_test` 只記算的那一刻的狀態，之後的改動不在紀錄裡。
+    - **所以原來的兩句是錯的**，已刪：「主 checkout 其他地方別的 session 的未提交改動不影響這一輪」（探測器還執行 `tools/p4_exercise`、`tools/test_workflow`、live-p1 的檔），以及「之後不再從共用 tree 讀 probe 程式」（`gen_runtime.py` 與子行程執行的檔不在其內）。`probe.py` 的 `LAB_PATH_MODULES` 註解也寫了同樣的話，**那段註解對這些檔是錯的**；第 6 輪已改成逐項寫出沒蓋到的是什麼、由什麼蓋（§10 finding 2）。
+    - **`exercise/` 的缺口在第 6 輪關了**（`ctrl_trial` 讀 `<run>/exercise`，S0 的副本對釘住的 commit 驗過）；清單裡剩下的檔仍然沒有程式在擋，靠「命令」第 3 行延伸過的 `git status`，和「跑的期間，這些檔沒有人動」（前提 1 的宣告要把這一點也寫進去）。
   - **已知的殘餘（第 5 輪不修）**：gate fingerprint 會算進主 checkout 的未追蹤檔（`identity.py:91-97` 的 `repo_untracked`，除了 `.test_run/`、`scratch/`、run 目錄和 may-differ 那幾類），而主 checkout 常有別的 session 的未追蹤檔，所以兩輪之間這一項可能不同。第一輪的紀錄換成常設授權前，要先把「`repo_untracked` 的變動算不算相符」定下來（Adam 另外決定）。
   - 這一輪的 HEAD 是凍結時 pin 住的那一個（health.json 的 `frozen_head`，也是 `repo_identity` 的 head）；主 checkout 上別的 session 之後再 commit，不改變凍結的 7 個檔與已載入的模組是什麼（commit 不改 working tree 的檔，所以清單裡的共用檔不因此被保護）。
 
@@ -207,7 +207,7 @@ git status --porcelain -- tools/p4_health tools/p4_exercise tools/test_workflow 
     doc/audit/2026-09-04_p4-tutorial-exercise-prep/live-p1/venv_fingerprint.sh     # 必須是空的（前提 3）。probe.py 的乾淨檢查只替 tools/p4_health 擋（不是空的就 rc 2）；其餘路徑只有這一行在擋，由人看，不是空的就不開跑
 NDT_OWNER=<owner> tools/test_workflow/ndt status                # 必須是 claim none、measuring nothing、bmv2 switches 0（claim 列 ndt:6849-6850，bmv2 switches 列 ndt:6992）
                                                                 # 不要用 --measuring：它只印 declared、measuring（或 orphaned，ndt:6803-6807；recover.sh:309-316 靠這一列）幾種列（ndt:6818-6824），看不到 claim 與 bmv2
-df -m /                                             # > 2500 MB（見「還沒修的缺陷」第 3 條；程式不查）
+df -m /                                             # > 2500 MB（見上面「第一次 live 時要照做的兩條」第 2 條；程式不查）
 RUN=$PWD/.test_run/p4_health/$(date -u +%Y-%m-%dT%H%M%SZ)_p4_health
 P4_HEALTH_RUN_DIR=$RUN tools/p4_health/run.sh lab --owner <owner>        # S0 → identity → A → B → 判格
 # 當掉、被中斷：tools/p4_health/recover.sh $RUN   （人執行）
@@ -223,14 +223,14 @@ P4_HEALTH_RUN_DIR=$RUN2 tools/p4_health/run.sh lab --owner <owner> --bringups A 
 **存檔**：把 `$RUN` 與 `$RUN2` 整個目錄抄進 audit-raw。
 
 
-**還沒修的缺陷（r5 審查 #3、#4、#5；第一次 live 之前要嘛修掉，要嘛 Adam 明說延後。修好之前，下面三條是程序的一部分）**
+**第一次 live 時要照做的兩條（r5 審查 #3、#4、#5 的程式部分在第 6 輪修了，見 §10；這兩條是讀結果的規矩，仍然有效）**
 
-1. **一個結果要 rc 與 health.json 的 `verdict` 兩個一致才算數**（#5、#3）。對應：COMPLETE＝0、PROBE-BROKEN＝1、INCOMPLETE 與 SEE-RED-NOT-SEEN＝2。
-   - `run_lab` 在 `lab.py:257` 寫 health.json（`report.dump` 是原地寫，不是 tmp＋replace，`report.py:75-78`），之後才寫 observations.json（`lab.py:258-263`）和 log 行（`:264-267`）。這之後的 `OSError`（磁碟滿最可能）會走到 `probe.main()` 的 catch-all（`probe.py:249-257`）：rc 2，印「refused: … it is INCOMPLETE, not a verdict」，而 health.json 已經在，可能寫著 PROBE-BROKEN、`problems` 是空的。看過紅那一次把 PROBE-BROKEN 當成「過」，所以這個組合會被誤讀成過。**rc 與 verdict 對不上，這一輪作廢**（先查磁碟）。catch-all 的訊息也以 `refused:` 開頭，與真正的拒絕同前綴；分辨靠有沒有 Traceback。
-   - 兩個停止訊號很接近（連按 Ctrl-C，或連續 `kill <pid>` 兩次）時，`probe.py lab` 可能以 Python 的 status 1 結束、沒有 health.json：`SignalAbort` 是 `BaseException`（`lab_round.py:54`），`main()` 只接 `Exception`（`probe.py:249`），而 run 層的 raiser（`lab.py:117-123`）從 `lab.py:205` 到 `:226` 之間一直裝著。**看過紅那一次，rc 1 但 `$RUN2/health.json` 不存在或 verdict 不是 PROBE-BROKEN ⇒ 不是過。**（讀碼得來，沒有實測。）
-2. **任何一次停止（kill、Ctrl-C）之後，先查 B 有沒有被 claim**（#4）。停止訊號若落在 `_finish` 讀完 `teardown_signal`（`lab_round.py:407`）與 handler 還原（`:403`；mask 從 `_swap_handlers` 內的 `:311` 才開始）之間，會被 `_noter`（`:299-304`）記在已經讀過的欄位上，不會再被讀；`run()` 回傳的紀錄沒有「aborted by signal」，`_rounds` 的 `signalled()`（`lab.py:112`、`:140`）是 False，把 A 當乾淨結束，接著 claim 並起 B。窗口只有幾十個位元碼（讀碼得來，沒有實測）。
-   - 查法：`$RUN/LAB_STATE.B.json` 存在（`keep_state`，`lab.py:94-98`）或 `$RUN/LAB_STATE.json` 屬於 B；`probe.log` 有「bring-up B (external)」那一行（`lab.py:156`）；再加 `NDT_OWNER=<owner> tools/test_workflow/ndt status` 的 claim 與 bmv2 列。**任何一項顯示 B 被 claim 過 ⇒ 停止被違背了，照 `recover.sh $RUN` 收拾。**
-3. **開跑前可用磁碟要高於下限**（#5 的誘因）。下限是 §6 命令寫的 **> 2500 MB**；探測器與 `run.sh` 都不查（`tools/p4_health/*.py`、`run.sh` 沒有 `statvfs`／`df`），只有人查。**今天（10-09）不夠**：r5 審查寫 2485 MB，交辦這次修正時寫約 2490 MB，編輯當下 `df -m /` 實測 2102 MB（另一個行程在用磁碟）；三個數字都低於 2500，所以今天不能開跑。
+1. **一個結果要 rc 與 health.json 的 `verdict` 兩個一致才算數**。對應：COMPLETE＝0、PROBE-BROKEN＝1、INCOMPLETE 與 SEE-RED-NOT-SEEN＝2。
+   - 第 6 輪起程式盡量讓兩者一致：`run_lab` 先寫 `observations.json`、最後才寫 `health.json`，都經過暫存檔與 `os.replace`；寫入失敗（磁碟滿最可能）不會留下一個帶 verdict 的 health.json；`probe.main()` 的 catch-all 在 rc 2 時，把已經在的 health.json 改名為 `health.json.not-a-verdict`，訊息以 `ERROR:` 開頭（不再是與真正拒絕相同的 `refused:`）；一個漏出 `run_lab` 的停止訊號是 rc 2、「stopped」，不再是 Python 的 status 1（§10 finding 3、5）。
+   - 但規矩不變：**rc 與 verdict 對不上，這一輪作廢**。看過紅那一次，rc 1 而 `$RUN2/health.json` 不存在或 verdict 不是 PROBE-BROKEN ⇒ 不是過。health.json 不存在、或只有 `health.json.not-a-verdict`，就是沒有 verdict。
+   - 第 6 輪的修法是讀碼加注入測試（`OSError` 注入在 `observations.json` 的寫入與 `os.replace`、log 呼叫）；真的磁碟滿沒有重現過。
+2. **開跑前可用磁碟要高於下限**。下限是 §6 命令寫的 **> 2500 MB**；探測器與 `run.sh` 都不查（`tools/p4_health/*.py`、`run.sh` 沒有 `statvfs`／`df`），只有人查。**今天（10-09）不夠**：r5 審查寫 2485 MB，r6 起跑時 `df -m /` 是 2100 MB，gate 期間最低 1042 MB（別的專案在用磁碟，見 §10.4）；都低於 2500，所以今天不能開跑。
+   - 停止之後先查 B 有沒有被 claim 這一條（r5 #4）：程式現在把 `_finish` 與 handler 還原放在同一個 signal mask 下，停止不再被吞掉（§10 finding 4），這條查法不再是程序的一部分；若仍想確認，`$RUN/LAB_STATE.B.json` 不存在、`probe.log` 沒有「bring-up B (external)」那一行、`ndt status` 沒有第二次 claim，就是 B 沒起。
 
 **時間（推論）**
 
@@ -383,7 +383,7 @@ P4_HEALTH_RUN_DIR=$RUN2 tools/p4_health/run.sh lab --owner <owner> --bringups A 
 | NIT 9 | `<run>/frozen` 已存在就拒絕；`os.mkdir`（不 exist_ok）建目錄、`O_CREAT\|O_EXCL\|O_NOFOLLOW` 開檔（`frozen.copy_file`）；放在目的地的連結被拒絕、目標不動 | `n789.RED.log`、`n9b.RED.log`（`b49c95a4`；子目錄的連結） | `n789.GREEN.log` | `C2R5-9a`–`9c` |
 | NIT 10 | `lab_round.py`：body 的 raiser 先換成收拾期間的 handler 再 raise；換 handler 時用 `pthread_sigmask` 擋住三個訊號；紀錄在 `_restore_handlers` **之前**定稿（`_finish`）；`LabRound.rec`，`lab.take_unrecorded` 在 run 被訊號或例外提前結束時補上已開始的輪的紀錄與 state 檔 | `n10_13.RED.log`（`5bebaa96`：第二個訊號跑出 `run()`、teardown 沒跑；`restore` 之後的訊號與例外讓該輪紀錄不見） | `n10_13.GREEN.log` | `C2R5-10a`–`10d` |
 | NIT 11 | `probe.py judge` 從紀錄讀 `stopped`（旗標、輪的 problems、run 的 problems）與 `see_red`（`mutant`／`see_red`）；`observations.json` 多寫 `bringups_complete`、`stopped`、`see_red`、`bringups`、`problems` | `n11.cells.RED.log`、`n11.collect.RED.log`（`8def2d90`） | `n11.cells.GREEN.log`、`n11.collect.GREEN.log` | `C2R5-11a`–`11f` |
-| NIT 12 | `ctrl_garbage_result` 標明是假設性的（真的 controller 用 tmp＋`os.replace`，`controller_ext.py:399-404`）；`runner.py` 的引用改成 66-71；`adapter_argv` 的 docstring 改成實話（S0 的 dry-run 用同一個 argv 加 `--dry-run`；controller trial 不經過 adapter）；選項：凍結的 adapter＋controller 照 B 的 argv（沒有 `-I`）真的啟動一次，p4runtime 用 stub，檢查載入的檔沒有一個在共用 tree 下，控制組是同樣啟動共用 tree 的檔、偵測器必須看到 | `n12.cells.GREEN.log`（沒有紅：沒有要修的行為；紅由控制組與 mutant 承擔） | 同左 | `C2R5-12` |
+| NIT 12 | `ctrl_garbage_result` 標明是假設性的（真的 controller 用 tmp＋`os.replace`，`controller_ext.py:399-404`）；`runner.py` 的引用改成 66-71；`adapter_argv` 的 docstring 改成實話（S0 的 dry-run 用同一個 argv 加 `--dry-run`；controller trial 不經過 adapter）；選項：凍結的 adapter＋controller 照 B 的 argv（沒有 `-I`；**直譯器是 `sys.executable`，不是 B 用的 p4dev 直譯器**〔`round_b.py:119`〕，所以「B 的 argv」只在形狀上成立，r5 審查 #8，第 6 輪已在測試的 docstring 寫明）真的啟動一次，p4runtime 用 stub，檢查載入的檔沒有一個在共用 tree 下，控制組是同樣啟動共用 tree 的檔、偵測器必須看到 | `n12.cells.GREEN.log`（沒有紅：沒有要修的行為；紅由控制組與 mutant 承擔） | 同左 | `C2R5-12` |
 | NIT 13 | `rec["complete"]` 也需要 `knobs_restored` | `n10_13.RED.log`（`True is not false`） | `n10_13.GREEN.log` | `C2R5-13` |
 
 ### 8.2 沒辦法確定性測的
@@ -397,14 +397,13 @@ P4_HEALTH_RUN_DIR=$RUN2 tools/p4_health/run.sh lab --owner <owner> --bringups A 
 ### 8.3 沒有改、或新發現的
 
 - **共用 tree 裡的碼，乾淨檢查和凍結都沒蓋到**（完整清單與行號在 §6 前提 3；r5 審查 #2 更正了原來較短的清單）：
-  - `exercise/gen_runtime.py`：S0 的 controller trial 在探測器行程內 exec（`ctrl_trial.py:36-41`、`:47`），模型從它來；
-  - `exercise/` 的副本：S0 一開始複製，不核對 HEAD（`s0.py:185-188`、`:312-316`；`lab.py:34-38`），T1／PL1 的預期從它來；
+  - `exercise/gen_runtime.py`（controller trial 的模型）與 `exercise/` 的副本（T1／PL1 的預期）：**第 6 輪已關**，副本對釘住的 commit 驗過、trial 讀副本（§10 finding 2）；
   - `openapi_probe.py`（`s0.py:663`）；`tools/p4_exercise/convert.py`、`preflight.py`；`tools/test_workflow/heartbeat_drop_check.py`；
   - `ndt` 與 `qdisc_snapshot.sh`，整輪都用；
   - live-p1 的 `code_identity.py` 與 `venv_fingerprint.sh`（`system_under_test` 與指紋的 interpreters 部分）。
   - 原來的清單漏了 gen_runtime 的行程內 exec、live-p1 的兩支、`ndt` 與 `qdisc_snapshot.sh`。#5 只涵蓋審查點名的 controller trial、adapter dry-run 與 identity 等模組；`LAB_PATH_MODULES` 看不到用路徑 exec 的檔（`hc_gen`、`hc_gen_lab` 不在 `sys.modules`）。
 - **gate fingerprint 的未追蹤檔變動**（`identity.py:91-97`）：依指示沒有修，寫在 §6 前提。
-- **`run_lab` 寫的 `observations.json` 不能直接交給 `probe.py judge`**：JSON 來回後 `table.py` 的 `t1` 對 list 做 `set()`（unhashable）。這在第 5 輪以前就如此；NIT 11 的離線測試用手做的紀錄，只釘 `judge` 讀的那幾個欄位。沒有修。
+- **`run_lab` 寫的 `observations.json` 不能直接交給 `probe.py judge`**：JSON 來回後 `table.py` 的 `t1` 對 list 做 `set()`（unhashable），修好之後 M1、M2、C1 拿 list 和 frozenset 比，三格會默默讀成 RED（r5 審查 #10）。這在第 5 輪以前就如此；NIT 11 的離線測試用手做的紀錄，只釘 `judge` 讀的那幾個欄位。**第 6 輪修了，並加了來回測試**（§10 finding 10）。
 - F10、`show_ports_trial` 沒有單元測試：沒有動。
 
 ### 8.4 r4 審查「數字對不起來」的處理
@@ -452,7 +451,7 @@ P4_HEALTH_RUN_DIR=$RUN2 tools/p4_health/run.sh lab --owner <owner> --bringups A 
 - **「數字對不起來」**：§8.1 #2 列的 ERROR／FAIL 數（`n2.collect.RED.log:145` 是 4 ERROR＋1 FAIL，`n2.cells.RED.log:17` 另有 1 FAIL）；§8.5 的 `GATE.run1_61c19eab.log` 第 1 行。
 - **順手改的（同一批 finding 的文字）**：§8.1 #4 列（s2 不是 primary 那一種是假設的，finding 8）、§8.1 #5 列（只對模組成立）、§8.2（`MUTATIONS == SELECTED` 不可能失敗，finding 7）、§6 前提的 Q6 引用改為 DESIGN.md §9。
 
-### 9.2 還開著的（下一輪 code；第一次 live 之前要嘛修掉，要嘛 Adam 明說延後）
+### 9.2 當時還開著的（第 6 輪全部處理了；逐項見 §10）
 
 | finding | 內容 | 位置 |
 |---|---|---|
@@ -469,3 +468,64 @@ P4_HEALTH_RUN_DIR=$RUN2 tools/p4_health/run.sh lab --owner <owner> --bringups A 
 - 另外兩條仍然是前提而不是 code：Adam 對這一次的逐次授權（DESIGN.md §9 Q6(a)）；`repo_untracked` 的變動算不算相符（§6 前提的「已知的殘餘」），要在第一輪的紀錄變成常設授權之前決定，不是第一次 live 之前。
 - 如果下一輪改了 code：所有 shard 在新的 head 上重跑，GATE 那一行連同四份 log 一起附上，那個 diff 另外審查。
 - 這份審查的 finding 3、4、5、10 是**讀碼**得來的，沒有執行過；上面的描述要這樣讀。
+
+## 10. 第 6 輪（r5 審查的程式項目）
+
+- **基底**：`257fd0e0`（r5 審查的對象 `269251f1` 之後的文件 commit；`tools/p4_health` 的 tree 與 `59d6b014` 相同，`fbf5a13c`）。**code 與測試的 head：`b09cd060`**（`tools/p4_health` 的 tree＝`4acc71ea`）；之後只有這份文件的 commit，tools 與 tests 沒有再動。
+- **LOG6** 指 `LOG/r6/`。每份 log 第 1 行是 `commit <sha>`，第 2 行有 `tracked-dirty=<n>`，最後一行 `rc=`——**除了** `disk_watchdog.log`（有 `start`／`end` 記錄，沒有 commit 行與 `rc=`）。
+  - 紅：每一項都是**先 commit 測試、再跑**；紅 log 的 commit 是只有測試、還沒修的那一個，`tracked-dirty=0`。第一項（finding 2）的紅在 `e85aab7a`，它的 `tools/p4_health` tree 與 `257fd0e0` 的相同（`fbf5a13c`）；其後各項的紅，tools 裡含有前面各項的修，測試仍在它自己的修之前紅。
+  - 綠：修的 commit 之後跑整份 cells、collect（和 finding 6、7 的 `test_p4_health_gate_scripts.sh`）。
+  - 每一項各一個「測試」commit 與一個「修」commit（修的 commit 同時帶它的 mutant）；有幾個測試 commit 後面接著一個很小的測試修正 commit（測試自己的錯，紅 log 在修正之後重跑）。
+- **新 mutant 的前綴**：`C2R6-`，共 53 個（表現在 450 個＝397＋53）。另有舊 mutant 的 anchor 隨被改動的行搬了位置：`18adf47c` 重新對位 B1、C2R3-N1c、C2R4-F4c、C2R5-7b、C2R5-11f（連同本輪自己的 3e），C2R5-10b 與 C2R5-6z 在各自的修裡重新對位；**我一開始漏了這件事**，是跑 `ANCHOR_CHECK=1` 才發現 5 個 anchor 數到 0。另有兩個舊 mutant 改了「指名的測試」（`C2R3-N3a`、`C2R5-10b`），原因見 §10.3。
+- **和 brief 不一致的一處**：brief 寫 shard `1/4`–`4/4`；gate script 的 shard 從 0 編號，`MUT_SHARD=4/4` 會被拒絕（k 必須小於 n），所以跑的是 `0/4`–`3/4`，log 叫 `mutate_p4_health.shard{0,1,2,3}of4.log`，和 r5 一樣。
+
+### 10.1 每一項
+
+| finding | 改了什麼 | 紅（LOG6） | 綠（LOG6） | mutant |
+|---|---|---|---|---|
+| 2（code） | `frozen.check_tree`／`Frozen.check_exercise`：S0 的 `exercise/` 副本必須恰好是釘住的 commit 在 `tools/p4_health/exercise` 下有的檔（扣掉副本本來就不含的 `__pycache__`、`build*`），每個檔 `git hash-object --no-filters` 等於 `git ls-tree` 的 blob；不同的、commit 沒有的、副本缺的、連結、git 答不出，都是 `Refused`。`S0.run` 在 `compile_all` 之後呼叫（不論 compile 成不成功），`probe.py cmd_lab` 把 `Refused` 變成 `refused:` rc 2，那時什麼 lab 動作都還沒做。`ctrl_trial.gen(exercise)`／`trial(exercise=)`：S0 傳 `self.ex`。`probe.py` 的 `LAB_PATH_MODULES` 註解改成實話（逐項寫沒蓋到什麼、由什麼蓋） | `n2.cells.RED.log`（11 個測試：4 FAIL 是行為——trial 用了共用 tree 的 CPU 埠 510 而不是副本的 4242、編輯過的／多的／少的檔都沒被拒絕，`(None, True) != (2, False)`；5 ERROR 是 `check_exercise` 還不存在；2 個控制組綠） | `n2.cells.GREEN.log`、`n2.cells.full.GREEN.log`、`n2.collect.full.GREEN.log` | `C2R6-2a`–`2k`（11 個） |
+| 3 | `lab._stop_on_signals`：run 層的 raiser 只觸發一次——先換成 noter（`pthread_sigmask` 擋住三個訊號再換，和各輪的一樣）再 raise；之後的停止只記進 `problems`（「further stop signal(s)…」）。`probe.main`：`SignalAbort` 是 rc 2、`stopped: … INCOMPLETE`，不是 Python 的 status 1 | `n3.collect.RED.log`（第二個停止跑出 run_lab 與 main；一階段的 noter 測試 ERROR）、`n3.cells.RED.log`（`SignalAbort` 跑出 `main`） | `n3.collect.GREEN.log`、`n3.cells.GREEN.log` | `C2R6-3a`–`3e` |
+| 4 | **選的是「`_finish` 與 handler 還原放在同一個 `pthread_sigmask` 下」**（`LabRound._masked`），不是「還原之後重讀 `teardown_signal`」。理由：窗口整個關掉，不用另外推理重讀之後的縫；停止會被送到 run 層的 handler（它結束整個 run），而不是被併進一份已經定稿的紀錄裡；探測器沒有 thread（`tools/p4_health` 沒有 `import threading`），擋主 thread 就是擋整個行程。`lab.take_unrecorded`：`_finish` 沒跑過（`seconds` 仍是 `None`）的紀錄標為不完整並加一條 problem | `n4.collect.RED.log`（`2 != 1 : B was claimed over the stop`；`True is not false`） | `n4.collect.GREEN.log`、`n4.cells.GREEN.log` | `C2R6-4a`–`4e` |
+| 5 | `report.write_json_atomic`（暫存檔、`fsync`、`os.replace`，失敗時刪暫存檔）；`report.dump` 用它。`run_lab` 先寫 `observations.json`、**最後**才寫 `health.json`。`probe.main` 的 catch-all：把已經在的 `health.json` 改名為 `health.json.not-a-verdict`（改名失敗也在訊息裡說），訊息以 `ERROR:` 開頭，不再是 `refused:`；漏出 `run_lab` 的 `SignalAbort` 同樣處理 | `n5.collect.RED.log`（5 個測試全紅：`['health.json'] != []`、`0 != 2`〔寫入沒經過 `os.replace`〕等） | `n5.collect.GREEN.log`、`n5.cells.GREEN.log` | `C2R6-5a`–`5f` |
+| 6 | `sum_p4_health_gate_shards.sh [--commit <sha>] <log>…`：GATE 那一行印 `commit`、`tree`、`subject sha`；logs 的 commit 不是 checkout 的 HEAD（有 `--commit` 時是那個 commit）、tools/p4_health 的 tree 不是那個 commit 的 tree、git 答不出 HEAD、`--commit` 不是 commit、沒給值、不認得的選項，都是 `NOT THE GATE`。checkout 是 script 自己的 `../..`，或 `$P4_HEALTH_SUM_REPO`。**subject sha 是工作檔的雜湊，commit 並不決定它，所以只在 logs 之間比、並印出來**，沒有和 checkout 比。`mutate_p4_health.sh`：`+UNCOMMITTED` 的 pathspec 變成 `WATCHED` 陣列，加上 gate 自己的三支 script、`tools/p4_exercise`、`p4_proxy/mininet/grpc_ports.py` | `n67.gatescripts.RED.log`（68 個檢查，22 個紅） | `n67.gatescripts.GREEN.log`（68，0 failed） | `C2R6-6a`–`6m`（13 個） |
+| 7 | 那個不可能失敗的 `(( MUTATIONS == SELECTED ))` **拿掉了**，換成一段註解指出真正的保險是加總 script 的份額檢查；**沒有為它寫 mutant**（沒有東西可以 mutate）。`GATES_SUM`：`gates_sum()` 對每個檔走 stdin（`sha256sum < "$f"`，輸出裡沒有路徑）再雜湊；也印在 header（`gates sum  :`），所以可以跨 log 比，並被測 | 同 finding 6 的紅（其中 4 個檢查是 finding 7 的） | 同上 | `C2R6-7a`–`7d`（4 個） |
+| 8 | FakeController 的「s2 不是 primary」標為**假設**（真的 controller 會記 `set_pipeline_ok: False` 加 `set_pipeline_error`，`controller_ext.py:150-156`），註解、docstring 都改；NIT 12 的啟動測試的 docstring 寫明直譯器是 `sys.executable`，不是 B 用的 p4dev 直譯器（`round_b.py:119`） | 沒有——只改註解與 docstring | `n2.collect.full.GREEN.log` 之後的整份綠（最後的檢查） | 沒有 mutant（文字） |
+| 10 | `cells/table.py` 的 `as_set`：t1 與 M1、M2、C1 比的是 `as_set(…)`，所以 set／tuple 變成 list 之後仍等。來回測試：`run_lab` → `observations.json` → `probe.py judge`，同樣的標題、rc、每一格的 verdict／reason／delta、rollup；三種 run：完整、看過紅（PROBE-BROKEN）、被停止（INCOMPLETE） | `n10.collect.RED.log`（3 個 ERROR：`TypeError: unhashable type: 'list'`，r5 審查寫的那一個） | `n10.collect.GREEN.log`、`n10.cells.GREEN.log` | `C2R6-10a`–`10e` |
+| 釘 HEAD 的 NIT | `probe.py cmd_lab` 在載入模組之前先問一次 HEAD（答不出就 rc 2），乾淨檢查之後再問一次，不同就 `refused: HEAD moved…`；凍結的 git 把「HEAD 是什麼」答成那個 sha，不再自己問。`repo_identity(head=frozen.head)` 原來就用凍結的 sha | `npin.cells.RED.log`（4 個：一個 commit 在釘住之後落下沒被拒絕、`frozen.head` 是後來的 HEAD、釘住不是第一個 git 呼叫、HEAD 答不出沒被拒絕） | `npin.cells.GREEN.log`、`npin.collect.GREEN.log` | `C2R6-pin-a`–`pin-d`（4 個） |
+
+mutant 的部分跑（`ONLY_LABEL_PREFIX=…`，**不是 gate**）：`mutate_p4_health.partial_C2R6-{2,3,4,5,5b,10,pin,6,7}.log`，各自 0 存活；`partial_C2R6-5` 一開始有 1 個存活（5b 的預期測試名寫錯，WRONG TEST），改名後 `partial_C2R6-5b` 抓到。另有 `partial_C2R3-N3a`、`partial_C2R5-10b`（§10.3 的兩個修）與一批舊前綴的診斷跑（`partial_C2R3-N3`、`C2R4-F4`、`C2R4-F8`、`R2-m4a`、`C2R5-2`、`C2R5-7`、`C2R5-5`），都 0 存活。
+
+### 10.2 沒辦法確定性測的，以及沒做的
+
+- **finding 4 的窗口本身**：測試從 `_finish` 裡的 hook 在「讀完 `teardown_signal` 之後」送停止，那是窗口裡的一個確定的點；任意位元碼上落下的停止沒有取樣。`pthread_sigmask` 是否真的擋住由 mutant `4b`（遮罩不擋任何訊號）與 `4c`（遮罩不放開）承擔。
+- **finding 4 的 NIT 殘餘**：A 的第一個停止落在 body 結束與 `_handlers(False)` 的換 handler 之間，仍然在 `finally` 裡 raise、略過 teardown（走 `recover.sh` 安全失敗）；現在那份紀錄標為不完整（有測試）。另外**讀碼得來、沒有測**：這樣跑出 `run()` 的那一輪，body 的 raiser 已經換成該輪的 noter 且沒有還原，直到 `run_lab` 的 `finally` 還原原來的 handler；那之間的停止被 noter 記下就丟了。
+- **finding 3**：「停止落在 run 層 handler 安裝與 `try:` 之間」用一個從 `cmd_lab` 丟出 `SignalAbort` 的 double 測 `main()`，不是真的在那一刻送訊號。
+- **finding 5**：沒有重現真的磁碟滿；`OSError(ENOSPC)` 是注入在 `observations.json` 的 `open` 與 `os.replace`、以及 `run_lab` 最後的 log 呼叫。
+- **finding 2**：「乾淨檢查之後的編輯」是在 git 的 `status` 呼叫之後的 hook 裡做的；真的時間差沒取樣。
+- **釘 HEAD 的 NIT**：「先於 `load_lab_path`」沒有被任何測試分辨（`load_lab_path` 不問 git）；乾淨檢查之後的再問一次擋住兩者之間的 commit，這一點有測。
+- **finding 6**：sum script 不拿 subject sha 和 checkout 比（見上）。
+- **finding 8**：沒有測試也沒有 mutant。`#5` 的偵測器只算 `sys.modules` 裡以 `p4_health` 開頭的名字、看不到用路徑 exec 的檔（r5 審查 #8 的第三點）仍是這樣——它的缺口由 finding 2 的檢查補，不是偵測器。
+- **沒做的**：r5 審查 #2 提到的可選項（S0 結束時審一次 `sys.modules`）；#6 的「A 的每一步例外只進 `A/problems.json`、不進 health.json 的 `problems`」（§6 步驟 5 仍是唯一的防線）；finding 1 的 ndt 端修法（在 ndt，不在這個分支）；`repo_untracked` 的決定（Adam）。
+
+### 10.3 gate 與最後的檢查（在 `b09cd060`，LOG6）
+
+- **mutation gate：450 個突變（397＋53），0 存活**，4 份 shard 各自有基線、負對照、byte-identical 與之後的檢查，全綠、`rc=0`（`mutate_p4_health.shard{0,1,2,3}of4.log`，113／113／112／112 個，「caught」行同數；四份都沒有 SURVIVED、WRONG TEST、HUNG、NO-SUITE、REFUSED、ENOSPC、Errno 28 的行）。四份第 1 行都是 `commit b09cd060…`，HEAD／tree／subject sha 行相同（`4acc71ea…`、`00baee280a968776`），header 的 `gates sum` 都是 `4851d9607830aed5`（第 6 輪起這個數是內容的雜湊，跨 log 可以比）。
+  - **加起來的那一行**（`LOG/r6/GATE.log`，`sum_p4_health_gate_shards.sh --commit b09cd060…`）：`GATE: 450 mutations, 0 survived, shards 4/4 ok, commit b09cd0600a0f44a8aa6a1d00989371af999d45ec, tree 4acc71ea869582232dca9c1d8a3f225e86d7c95b, subject sha 00baee280a968776`。跑加總的時候 HEAD 就是 `b09cd060`；文件 commit 在它之後，所以之後要再跑這支 script 得帶 `--commit b09cd060…`，不帶的話它會拒絕（這是 finding 6 要的行為；`GATE.at_doc_head_without_commit.log`）。
+  - **這一次 gate 之前還跑了兩次，結果都不是 gate**，各留了 log：
+    1. 在 `520e6034`，shard 0 跑到第 90 個左右我自己停掉（`mutate_p4_health.aborted_520e6034_shard0of4.log`，最後一行寫 `rc=killed by me`）：`C2R3-N3a`（git 答不出 `status` 當成乾淨）存活。原因是 finding 的釘 HEAD 讓 git 壞掉的情況在 `rev-parse` 就被拒絕，舊測試 `test_a_git_that_cannot_answer_is_refused_before_s0` 再也走不到 `status` 那一行；新增 `test_a_git_status_that_cannot_answer_is_refused_before_s0`（只讓 `status` 失敗），mutant 改指它（`c82a9f49`）。
+    2. 在 `c82a9f49`，四份 shard 跑完（`mutate_p4_health.run1_c82a9f49.shard*of4.log`，`GATE.run1_c82a9f49.log`＝`NOT THE GATE`）：shard 0 有 1 個存活 `C2R5-10b`（WRONG TEST，紅的是另一個測試）。原因是 finding 4 的 mask 之後，「`_finish` 在還原之後」與「在還原之前」對一個落在還原之後的停止沒有差別，原來指名的測試不再分辨它；順序現在只在還原裡丟例外時看得出，mutant 改指 `test_an_exception_after_a_rounds_record_is_final_keeps_that_rounds_record`（`b09cd060`）。shard 1–3 在那一次是 `rc=0`。
+    - 這兩個存活都是我自己的修造成的測試漏洞，在 gate 才發現，不是在各項的部分跑裡發現（部分跑只跑新 mutant 的前綴）；之後改在重跑 gate 之前，先把可能受影響的舊 mutant 前綴（`C2R3-N3`、`C2R4-F4`、`C2R4-F8`、`R2-m4a`、`C2R5-2`、`C2R5-5`、`C2R5-7`）部分跑過一遍（都 0 存活）。
+  - **shard 3 的行程被停住了 17 分鐘**：19:43 到 20:00 之間，shard 3 的 `timeout`／bash 行程都在狀態 T（stopped），原因不明（我沒有送 SIGSTOP；系統日誌沒有相關行）。20:00 我送 SIGCONT，當時的突變（`C5`）之後 `✅ caught`，並放了一個每 30 秒檢查、有 T 就 SIGCONT 的看守（`disk_watchdog.log` 20:00:13 那一行）；之後沒有再停過（看守沒有記錄）。這 17 分鐘在 log 裡看不到，只在 `disk_watchdog.log` 與這裡。整個 shard 的 `timeout 21600` 沒有影響。
+  - 分段的部分跑（`ONLY_LABEL_PREFIX=…`，不是 gate）：見 §10.1 與 `LOG/r6/mutate_p4_health.partial_*.log`。
+- 最後的檢查（`p4_proxy/venv/bin/python`；都在文件 commit 之後的 HEAD 重跑過一次，log 第 1 行是那個 commit）：
+  - `check_gate_anchors.py HEAD`：133/133 cells ok，`mutate_p4_health.sh` ok(420)（`check_gate_anchors.HEAD.log`）；
+  - `check_test_tmpdirs.py`：416 個檔，0 個固定暫存路徑（`check_test_tmpdirs.log`）；
+  - collect 174 個 OK（162＋12）、cells 170 個 OK（153＋17）、`test_p4_health_recover.sh` 163 checks 0 failed（沒變）、`test_p4_health_gate_scripts.sh` 68 checks 0 failed（43＋25）（`test_collect.log`、`test_cells.log`、`test_recover.log`、`test_gate_scripts.log`）。
+
+### 10.4 磁碟
+
+- 起跑時 `df -m /` 是 2100 MB（低於平常的 2500 下限），整個過程由別的專案在用磁碟；我沒有碰別人的檔，自己的突變複本與暫存目錄都由 gate 的 `trap` 清掉（我自己停掉那一次的 `/tmp/p4-health-mutate-*` 手動刪了）。
+- 看門狗（`LOG/r6/disk_watchdog.log`）每 30 秒寫一行 `date`、`free_mb`，共 2152 筆，第 1 行 `start`、最後一行 `end 2026-10-09 21:18:09 free_mb=1375`。**最低 1042 MB（20:10:50，在最後那次 gate 的 shard 3 裡）**，最高 2624 MB。
+- 每一份 shard 開跑前先查 `df`：低於 1800 就等（每 5 分鐘一次，記在看門狗 log）。**實際等過一次**：第二次 gate 的 shard 0 結束後（15:35），`free` 在 1695–1746 MB，等了 9 次（15:35–16:15，約 45 分鐘），到 16:20 回到 2563 MB 才開 shard 1。其餘的開跑點 free 在 1843–2616 MB。
+- **跑的當中不會停**（brief 只要求開跑前查）：最後一次 gate 裡 free 曾低到 1042 MB，四份 shard 沒有 ENOSPC、Errno 28、No space、HUNG、NO-SUITE、WRONG TEST、SURVIVED 的行。機制上低磁碟的方向是假 caught，不是漏跑（§8.5）；這個 gate 的結果沒有因此受影響的跡象，但「沒有任何一個 caught 是 ENOSPC 造成的」我沒有逐個證明。
+- 第一次 live 的下限仍是 > 2500 MB（§6）；今天（10-09）整天都低於它，所以今天不能開跑。
