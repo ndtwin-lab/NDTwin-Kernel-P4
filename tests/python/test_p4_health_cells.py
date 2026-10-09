@@ -2912,6 +2912,89 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
             fz.check_exercise(copy)
 
 
+    # --- round 7, finding 4: the exercise copy is checked again right before lab.load_model runs it ------------------
+    FAKE_CONVERT = (
+        "import json, os, sys\n"
+        "exercise = sys.argv[1]\n"
+        "out = sys.argv[sys.argv.index('--out') + 1]\n"
+        "edit = os.environ.get('FAKE_CONVERT_EDIT', '')\n"
+        "if edit == 'append':\n"
+        "    with open(os.path.join(exercise, 'gen_runtime.py'), 'a') as fh:\n"
+        "        fh.write('\\nEDITED_BY_CONVERT = True\\n')\n"
+        "elif edit == 'add':\n"
+        "    with open(os.path.join(exercise, 'extra_model.py'), 'w') as fh:\n"
+        "        fh.write('# written by convert\\n')\n"
+        "os.makedirs(out)\n"
+        "with open(os.path.join(out, 'package.json'), 'w') as fh:\n"
+        "    json.dump({}, fh)\n")
+
+    def run_lab_after_a_convert_that(self, edit):
+        """S0.convert over the checked exercise copy, with a fake convert.py that `edit`s ('append' to gen_runtime.py,
+        'add' a file, '' nothing) the directory it is given as input; then lab.run_lab with that S0's Frozen. The
+        model is loaded by the real lab.load_model; `expectations` and the rounds are markers, and the lab runner
+        is a RecordingRunner that must stay empty. Returns (rc, doc, models `expectations` was handed, the number
+        of rounds started, the lab runner's calls)."""
+        import tempfile
+        from unittest import mock
+        from p4_health import lab as LAB
+        from p4_health import s0 as S0M
+        from p4_health.collect.config import Config
+        from p4_health.collect.runner import RecordingRunner, Runner
+        fz, copy = self.freeze_with_exercise()
+        run_dir = os.path.dirname(copy)
+        script = os.path.join(run_dir, "fake_convert.py")
+        with open(script, "w") as fh:
+            fh.write(self.FAKE_CONVERT)
+
+        class Redirect(Runner):
+            def run(self, argv, env=None, timeout=120, cwd=None, input_text=None):
+                return Runner.run(self, [sys.executable, script] + list(argv[2:]),
+                                  env=dict(env or {}, FAKE_CONVERT_EDIT=edit), timeout=timeout, cwd=cwd,
+                                  input_text=input_text)
+        x = S0M.S0(run_dir, Redirect(), sys.executable, frozen=fz, log=lambda *a: None)
+        self.assertEqual(x.ex, copy)
+        self.assertIsNotNone(x.convert("A", "topology.json", "ndtwin"))
+        models, rounds = [], []
+
+        def expectations(s0_out, rd, model):
+            models.append(model)
+            return {}, {}, {}
+        lab_runner = RecordingRunner()
+        with mock.patch.object(LAB, "expectations", expectations), \
+                mock.patch.object(LAB, "_rounds", lambda *a, **kw: rounds.append(1)):
+            rc, doc = LAB.run_lab(Config(run_dir, owner="o"), lab_runner, {"verdict": "COMPLETE"}, run_dir, "run-x",
+                                  expected_tsv=EXPECTED_TSV, log=lambda *a: None, signals=False, frozen=fz)
+        return rc, doc, models, len(rounds), lab_runner.calls, fz
+
+    def test_a_convert_that_appends_to_the_exercise_copys_gen_runtime_is_refused_before_load_model_runs_it(self):
+        """(Finding 4) The copy is checked once, right after S0 compiles; S0 then hands it to the shared tree's
+        convert.py as its input, and lab.load_model runs gen_runtime.py from it much later. A convert.py that
+        wrote into its input was run, not refused. load_model is before any claim, so the refusal is the run's
+        ordinary 'could not be set up': INCOMPLETE, rc 2, nothing started, and the record says which file."""
+        rc, doc, models, rounds, calls, fz = self.run_lab_after_a_convert_that("append")
+        self.assertEqual(models, [], "the edited gen_runtime.py was loaded: %r" % [
+            getattr(m, "EDITED_BY_CONVERT", None) for m in models])
+        self.assertEqual((rounds, calls), (0, []))
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        text = " | ".join(doc["problems"])
+        self.assertIn("could not be set up", text)
+        self.assertIn("gen_runtime.py", text)
+        self.assertIn(fz.head, text)
+
+    def test_a_convert_that_adds_a_file_to_the_exercise_copy_is_refused_before_load_model_too(self):
+        rc, doc, models, rounds, calls, _fz = self.run_lab_after_a_convert_that("add")
+        self.assertEqual((models, rounds, calls), ([], 0, []))
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        self.assertIn("extra_model.py", " | ".join(doc["problems"]))
+
+    def test_a_convert_that_leaves_the_exercise_copy_alone_goes_on_to_the_rounds(self):
+        """The control of the two tests above."""
+        rc, doc, models, rounds, calls, _fz = self.run_lab_after_a_convert_that("")
+        self.assertEqual(doc["problems"], [])
+        self.assertEqual((len(models), rounds), (1, 1))
+        self.assertFalse(hasattr(models[0], "EDITED_BY_CONVERT"))
+
+
     # --- round 6, the pin-HEAD NIT: HEAD is pinned first, and the clean check, the freeze and the identity use it --
     def lab_pinned(self, hook=None):
         """probe.py lab in a scratch repo whose S0 is a marker that keeps the Frozen it was given. `hook(args)`
