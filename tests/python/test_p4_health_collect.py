@@ -254,6 +254,23 @@ class Sealed(unittest.TestCase):
                           test_run_dir=os.path.join(self.tmp, "test_run"),
                           thrift_cli=["simple_switch_CLI"], qdisc_snapshot="qdisc_snapshot.sh",
                           expected_tsv=os.path.join(self.tmp, "none.tsv"))
+        # (round 7) A mutant (or a bug) that leaves the stop signals blocked after a test must not hand the signals
+        # it left pending to a later test: they would be delivered at that test's next mask change, and a SIGINT then
+        # ends the whole run with a KeyboardInterrupt -- no "Ran N tests" line, which the mutation gate refuses.
+        # Whatever the mask was at the start of the test is put back, pending stops going to no-op handlers.
+        self._mask0 = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        self.addCleanup(self._put_the_signal_mask_back)
+
+    def _put_the_signal_mask_back(self):
+        stops = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        old = {s: signal.signal(s, lambda n, f: None) for s in stops}
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, self._mask0)
+            for _ in range(2000):
+                pass                                    # a pending stop is delivered here, to a handler that does nothing
+        finally:
+            for s, h in old.items():
+                signal.signal(s, h)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
