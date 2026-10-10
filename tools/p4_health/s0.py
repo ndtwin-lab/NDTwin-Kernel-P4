@@ -13,13 +13,16 @@ the Runner does not wrap (a long-lived child stopped by its pid): see throwaway.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 
 from . import frames as F
+from . import frozen as FZ
 from . import runtime_cli as RC
 from . import throwaway as TW
 from .cells import table as T
@@ -146,6 +149,26 @@ def show_ports_ok(parsed, data_ports=(1, 2, 3), cpu_port=510):
     return parsed is not None and set(parsed) - {cpu_port} == set(data_ports)
 
 
+#: The signals a stop arrives as (lab_round.LabRound.SIGS, lab.STOP_SIGNALS).
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+@contextlib.contextmanager
+def stops_held():
+    """(Cut 2 round 7, finding 1) SIGTERM, SIGINT and SIGHUP blocked in the calling thread for the body of the `with`,
+    and the mask that was there put back afterwards, an exception included. A thread inherits the mask of the thread
+    that starts it, so every thread gRPC starts inside the body blocks the three for good; a lab round's own mask
+    (lab_round.LabRound._masked) covers the calling thread only, and `lab.run_lab` refuses to start the lab while a
+    thread of this process can take a stop. A stop that arrives meanwhile stays pending and is delivered, to
+    whatever handler is in place, when the mask is put back (S0 has none of its own: the default action ends the
+    process, as before, after the trial rather than in the middle of it)."""
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+
+
 def preflight_rows(stdout):
     """(FAIL rows, the problem lines under them) out of preflight.py's table."""
     return [line for line in (stdout or "").splitlines() if line.startswith("  FAIL")]
@@ -185,7 +208,7 @@ class S0(object):
     def compile_all(self):
         if os.path.exists(self.ex):
             shutil.rmtree(self.ex)
-        shutil.copytree(EXERCISE, self.ex, ignore=shutil.ignore_patterns("__pycache__", "build*"))
+        shutil.copytree(EXERCISE, self.ex, ignore=shutil.ignore_patterns(*FZ.COPY_IGNORE))
         src = os.path.join(self.ex, SRC_REL)
         for outdir, stem, defines in BUILDS:
             d = os.path.join(self.ex, outdir)
@@ -201,6 +224,15 @@ class S0(object):
             self.check("compile %s %s" % (key, " ".join(defines)), ok,
                        "p4info %s" % (self.out["builds"][key]["p4info_sha16"],))
         return all(b["rc"] == 0 for b in self.out["builds"].values())
+
+    def check_exercise_copy(self):
+        """(Cut 2 round 6, finding 2) The copy of exercise/ made at the start of compile_all is the model every
+        later step goes by (this class, lab.load_model, the controller trial). A lab run froze its code
+        against one pinned commit: the copy is checked against that commit as the frozen files are, and a
+        mismatch raises frozen.Refused -- `probe.py lab` answers rc 2 before any lab action. S0 on its own
+        (no frozen) has no commit to check against."""
+        if self.frozen is not None and getattr(self.frozen, "head", None):
+            self.frozen.check_exercise(self.ex)
 
     def p4info_identity(self):
         b = self.out["builds"]
@@ -560,9 +592,12 @@ class S0(object):
         """VS1's Cut 2 safety question (review MAJ-8), asked of throwaway simple_switch_grpc."""
         try:
             from . import vs_trial as VT
-            results = [VT.trial(os.path.join(self.ex, "build"), b, self.thrift_cli,
-                                os.path.join(self.run_dir, "vs_trial_work"))
-                       for b in ("/usr/local/bin/simple_switch_grpc", VT.fabric_binary())]
+            # (round 7, finding 1) the trial runs gRPC in this process, and the threads gRPC starts must not be
+            # able to take a stop: see stops_held
+            with stops_held():
+                results = [VT.trial(os.path.join(self.ex, "build"), b, self.thrift_cli,
+                                    os.path.join(self.run_dir, "vs_trial_work"))
+                           for b in ("/usr/local/bin/simple_switch_grpc", VT.fabric_binary())]
         except Exception as exc:  # noqa: BLE001
             self.check("ValueSetEntry trial on throwaway simple_switch_grpc", False,
                        "%s: %s" % (type(exc).__name__, exc))
@@ -590,7 +625,7 @@ class S0(object):
             ctrl = {"controller": self.frozen.controller} if self.frozen else {}
             results = [CT.trial(os.path.join(self.ex, "build"), b, self.thrift_cli,
                                 os.path.join(self.run_dir, "ctrl_trial_work", "%d" % i),
-                                default_p4dev_python(), utils, **ctrl)
+                                default_p4dev_python(), utils, exercise=self.ex, **ctrl)
                        for i, b in enumerate(("/usr/local/bin/simple_switch_grpc", fabric_binary()))]
         except Exception as exc:  # noqa: BLE001
             self.check("B's controller on throwaway simple_switch_grpc", False,
@@ -683,7 +718,9 @@ class S0(object):
 
     def run(self):
         os.makedirs(self.run_dir, exist_ok=True)
-        if self.compile_all():
+        built = self.compile_all()
+        self.check_exercise_copy()
+        if built:
             self.p4info_identity()
             self.take_inventory()
             self.packages()

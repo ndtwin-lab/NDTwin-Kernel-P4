@@ -36,15 +36,27 @@ from p4_health.collect.runner import Runner  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 #: (Cut 2 round 5, #5) Every module of the package that the probe process can load on a lab run. `cmd_lab`
-#: imports them all BEFORE its clean check, so that no probe code is read from the shared tree after the
-#: check: identity.py (the gate fingerprint, the standing authorization's baseline) and the modules S0
-#: imports lazily (vs_trial, ctrl_trial, round_b, ...) used to be first imported ~2 minutes later, from
-#: whatever the tree held then. Chosen over re-verifying each loaded module's file against HEAD just before
-#: run_lab because the check would compare the FILE, not the code the process loaded (an edit made and
-#: undone in between passes it), and because it could not cover a module loaded after it. What stays
-#: outside: the files run as scripts (probe.py itself, hostside.py -- root runs the frozen copy --,
-#: openapi_probe.py, capture_thrift_fixtures.py), and the window between the process's start and the check,
-#: in which the package's top-level imports (cells, collect.config, expected, report, runner) were read.
+#: imports them all BEFORE its clean check, so that no module of the package is first read from the shared
+#: tree after the check: identity.py (the gate fingerprint, the standing authorization's baseline) and the
+#: modules S0 imports lazily (vs_trial, ctrl_trial, round_b, ...) used to be first imported ~2 minutes later,
+#: from whatever the tree held then. Chosen over re-verifying each loaded module's file against HEAD just
+#: before run_lab because the check would compare the FILE, not the code the process loaded (an edit made and
+#: undone in between passes it), and because it could not cover a module loaded after it.
+#: What the list does not cover, and what covers it instead (round 6; "no probe code is read after the check"
+#: was never true):
+#:   * files exec'd by path, which are never in sys.modules: exercise/gen_runtime.py (the model). S0 copies
+#:     exercise/ into the run dir and checks the copy against the pinned commit right after compile_all
+#:     (frozen.check_tree: a mismatch is rc 2 before any lab action); lab.load_model, S0 and the controller trial
+#:     then load the COPY, never the shared tree's file. (round 7) S0 then hands the copy to the shared tree's
+#:     convert.py as input, so lab.run_lab checks it again, against the same commit, immediately before
+#:     lab.load_model runs gen_runtime.py from it (still before any claim).
+#:   * files run as scripts from the shared tree, read when they run and checked by nothing: probe.py itself,
+#:     openapi_probe.py, capture_thrift_fixtures.py, tools/p4_exercise/convert.py and preflight.py,
+#:     tools/test_workflow/heartbeat_drop_check.py, ndt and qdisc_snapshot.sh, and the live-p1 code_identity.py
+#:     and venv_fingerprint.sh. An edit to one of them, made before the run or during it, is used.
+#:   * hostside.py, which root runs: the frozen copy, checked against HEAD (frozen.py).
+#:   * the window between the process's start and the check, in which the package's top-level imports (cells,
+#:     collect.config, expected, report, runner) were read.
 #: tests: the list is the package's module list, less those script-only files.
 LAB_PATH_MODULES = (
     "p4_health.attribution", "p4_health.cells.table", "p4_health.cells.verdict", "p4_health.collect.config",
@@ -142,6 +154,13 @@ def cmd_judge(args):
 def cmd_lab(args):
     """S0 in the run directory, then the lab (lab.run_lab). The owner is required: every ndt
     call carries it (CLAUDE.md), and claims are made in its name."""
+    # (Cut 2 round 6, the pin-HEAD NIT) HEAD is resolved ONCE, before anything else is read: the modules are
+    # loaded, the tree is checked and the code is frozen against THIS commit, and the identity names it. A
+    # commit landing in between is refused below, not folded in.
+    h_rc, pinned = _git_run("rev-parse", "--verify", "HEAD")
+    if h_rc != 0 or not pinned:
+        print("refused: git could not name HEAD (rev-parse rc %s)" % (h_rc,), file=sys.stderr)
+        return 2
     load_lab_path()
     from p4_health import lab as L
     from p4_health.collect.config import Config
@@ -162,6 +181,18 @@ def cmd_lab(args):
         print("refused: tools/p4_health has uncommitted changes; a lab run runs only committed "
               "code:\n%s" % dirty, file=sys.stderr)
         return 2
+    h_rc, now = _git_run("rev-parse", "--verify", "HEAD")
+    if h_rc != 0 or now != pinned:
+        print("refused: HEAD moved from %s to %s while the lab path was loaded and the tree checked; the "
+              "modules and the clean check are of the first, run again" % (pinned, now or "(unreadable)"),
+              file=sys.stderr)
+        return 2
+
+    def git_at_pinned_head(*a):
+        """The freeze's git: the question 'what is HEAD' is answered with the pinned sha, not asked again."""
+        if a == ("rev-parse", "--verify", "HEAD"):
+            return 0, pinned
+        return _git_run(*a)
     run_dir = os.path.abspath(args.run_dir)
     run_id = os.path.basename(run_dir.rstrip("/"))
     # (Cut 2 round 4, F4) Freeze right after the clean check, before S0: every round runs these
@@ -169,7 +200,7 @@ def cmd_lab(args):
     # here, before any lab action (git that cannot answer is a refusal too)
     from p4_health import frozen as FZ
     try:
-        frozen = FZ.freeze(run_dir, repo=REPO, git=_git_run)
+        frozen = FZ.freeze(run_dir, repo=REPO, git=git_at_pinned_head)
     except FZ.Refused as exc:
         print("refused: %s" % exc, file=sys.stderr)
         return 2
@@ -179,7 +210,12 @@ def cmd_lab(args):
     print("lab run %s -> %s  (HEAD %s, probe tree %s)" % (run_id, run_dir, ident["head"], ident["probe_tree"]))
     s0 = S0(run_dir, runner, py, frozen=frozen)
     s0.out["repo"] = ident
-    s0.run()
+    try:
+        s0.run()
+    except FZ.Refused as exc:
+        # (round 6, finding 2) S0's copy of exercise/ is not what the pinned commit has: no lab action
+        print("refused: %s" % exc, file=sys.stderr)
+        return 2
     print("S0 %s" % s0.out["verdict"])
     cfg = Config(run_dir, owner=owner)
     bringups = tuple(b for b in (args.bringups or "A,B").split(",") if b)
@@ -218,6 +254,21 @@ def cmd_lab(args):
     return rc
 
 
+def set_verdict_aside(run_dir):
+    """(Cut 2 round 6, finding 5) A run that ends rc 2 on an exception must not leave a health.json that reads as
+    a verdict: an existing one is renamed health.json.not-a-verdict. Returns the sentence that says what was
+    done, "" when there was nothing to do."""
+    path = os.path.join(os.path.abspath(run_dir), "health.json")
+    if not os.path.lexists(path):
+        return ""
+    aside = path + ".not-a-verdict"
+    try:
+        os.replace(path, aside)
+    except OSError as exc:
+        return "health.json could NOT be set aside (%s): it is not a verdict, whatever it says." % exc
+    return "health.json was set aside as %s: it is not a verdict." % aside
+
+
 def main(argv=None):
     if os.geteuid() == 0:
         print("refusing to run as root (design 7.3)", file=sys.stderr)
@@ -244,15 +295,27 @@ def main(argv=None):
     if args.cmd == "judge":
         return cmd_judge(args)
     if args.cmd == "lab":
+        from p4_health.lab_round import SignalAbort
         try:
             return cmd_lab(args)
+        except SignalAbort as exc:
+            # (round 6, finding 3) A BaseException: `except Exception` below does not see it, and Python's
+            # status for it is 1 -- PROBE-BROKEN, the see-red run's pass. A stop that reached the run level
+            # outside run_lab's own try ends the run INCOMPLETE rc 2.
+            print("stopped: signal %d ended the lab run outside any round's body; it is INCOMPLETE, not a "
+                  "verdict. %s If a round was under way, finish with recover.sh on the run dir."
+                  % (exc.signum, set_verdict_aside(args.run_dir)), file=sys.stderr)
+            return 2
         except Exception:  # noqa: BLE001
             # (Cut 2 round 5, #2) Python's status for an uncaught exception is 1 -- PROBE-BROKEN, which on
             # the see-red run is the pass. Whatever the lab path did not foresee is INCOMPLETE rc 2.
             import traceback
             traceback.print_exc()
-            print("refused: the lab run ended on an exception (above); it is INCOMPLETE, not a verdict. "
-                  "If a round was under way, finish with recover.sh on the run dir.", file=sys.stderr)
+            # (round 6, finding 5) not `refused:` -- the prefix of the deliberate refusals -- and a health.json
+            # that is already on disk is set aside, so that rc and health.json cannot disagree
+            print("ERROR: the lab run ended on an exception (above); it is INCOMPLETE, not a verdict. %s "
+                  "If a round was under way, finish with recover.sh on the run dir."
+                  % set_verdict_aside(args.run_dir), file=sys.stderr)
             return 2
     ap.print_help()
     return 2

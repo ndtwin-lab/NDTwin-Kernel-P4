@@ -254,6 +254,23 @@ class Sealed(unittest.TestCase):
                           test_run_dir=os.path.join(self.tmp, "test_run"),
                           thrift_cli=["simple_switch_CLI"], qdisc_snapshot="qdisc_snapshot.sh",
                           expected_tsv=os.path.join(self.tmp, "none.tsv"))
+        # (round 7) A mutant (or a bug) that leaves the stop signals blocked after a test must not hand the signals
+        # it left pending to a later test: they would be delivered at that test's next mask change, and a SIGINT then
+        # ends the whole run with a KeyboardInterrupt -- no "Ran N tests" line, which the mutation gate refuses.
+        # Whatever the mask was at the start of the test is put back, pending stops going to no-op handlers.
+        self._mask0 = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        self.addCleanup(self._put_the_signal_mask_back)
+
+    def _put_the_signal_mask_back(self):
+        stops = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        old = {s: signal.signal(s, lambda n, f: None) for s in stops}
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, self._mask0)
+            for _ in range(2000):
+                pass                                    # a pending stop is delivered here, to a handler that does nothing
+        finally:
+            for s, h in old.items():
+                signal.signal(s, h)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1457,7 +1474,11 @@ class FakeFabric(object):
         self.pipelines = dict(PIPES4)
         self.ctrl_register_ok = False      # bmv2's P4Runtime refuses register writes today
         self.ctrl_connect_error = False    # (round 5, #4) no switch answers the controller's arbitration
-        self.ctrl_s2_not_primary = False   # (round 5, #4) s2 grants the pipeline but not primary
+        # (round 5, #4) s2 is not primary. HYPOTHETICAL, not copied from controller_ext.py: P4Runtime refuses a
+        # pipeline push from a backup client, so the real controller records set_pipeline_ok False plus
+        # set_pipeline_error for such a switch (controller_ext.py:150-156); this fake keeps set_pipeline_ok True and
+        # lets every attribution confirm -- a fair worst case for the rule, not the controller's own shape.
+        self.ctrl_s2_not_primary = False
         self.ctrl_fail = set()
         self.ctrl_no_result = False
         self.fail_entry = None
@@ -1937,6 +1958,8 @@ class FakeController(object):
                    "set_pipeline_ok": True, "routes_written": len(RUNTIMES[d]["table_entries"]),
                    "routes_failed": 0}
             if d == 2 and self.fab.ctrl_s2_not_primary:
+                # HYPOTHETICAL (see ctrl_s2_not_primary): the real controller would also record
+                # set_pipeline_ok False and set_pipeline_error here (controller_ext.py:150-156)
                 rec.update({"primary": False, "arbitration_status": 6})      # ALREADY_EXISTS: another election id holds it
             out[str(d)] = rec
         return out
@@ -2863,7 +2886,9 @@ class TestTheLabRun(Cut2):
         self.assertEqual(doc["attributions"]["ternary"]["ok"], False)
 
     def test_b_whose_controller_is_not_primary_on_s2_is_a_failed_b(self):
-        """s2 granted the pipeline (set_pipeline_ok) but not primary (controller_ext.py:148-157), and the
+        """HYPOTHETICAL shape: s2 granted the pipeline (set_pipeline_ok) but not primary. The real controller
+        would record set_pipeline_ok False plus set_pipeline_error for a backup client (controller_ext.py:150-156);
+        this is the worst case for the rule, not a copy of what the controller writes. And the
         attributions that followed all confirmed: B still did not do its part."""
         self.fab.ctrl_s2_not_primary = True
         rc, doc, _r = self.run_lab()
@@ -3133,6 +3158,442 @@ class TestTheLabRun(Cut2):
         self.assertTrue(doc["bringups"][0]["complete"])
         self.assertTrue(any("B not brought up" in p_ for p_ in doc["problems"]), doc["problems"])
         self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+
+
+    # --- round 6, finding 3: the run-level stop handler is one-shot ------------------------------------------
+    def probe_main_over_run_lab(self, **kw):
+        """`probe.main(["lab", ...])` -- main()'s own exit-status handling -- around this harness's run_lab in
+        place of cmd_lab's S0, freeze and identity work. Returns (rc, run_lab's rc or None)."""
+        from p4_health import probe
+        got = []
+
+        def cmd_lab(args):
+            rc, _doc, _r = self.run_lab(**kw)
+            got.append(rc)
+            return rc
+        with mock.patch.object(probe, "cmd_lab", cmd_lab):
+            return probe.main(["lab", "--run-dir", self.cfg.run_dir, "--owner", "o"]), (got or [None])[0]
+
+    def test_a_second_stop_while_run_lab_handles_the_first_gives_rc_2_not_pythons_status_1(self):
+        """(Finding 3) The run-level handler stayed installed while run_lab's `except SignalAbort` body ran
+        (take_unrecorded copies files there): a second stop raised again, out of run_lab and out of main(), and
+        Python exits 1 -- PROBE-BROKEN, the see-red run's pass -- with no health.json. The first stop comes
+        between the rounds (as in test_a_stop_between_the_rounds_...), the second from inside the body."""
+        seen = []
+        safety = signal.signal(signal.SIGTERM, lambda n, f: seen.append(n))
+        real_keep, real_take = LAB.keep_state, LAB.take_unrecorded
+
+        def keep_then_kill(cfg, bringup):
+            real_keep(cfg, bringup)
+            if bringup == "A":
+                os.kill(os.getpid(), signal.SIGTERM)            # the first stop
+        asked = []
+
+        def take_after_a_second_stop(cfg, holder, recs):
+            asked.append(1)
+            os.kill(os.getpid(), signal.SIGTERM)                # the second, in the except body
+            real_take(cfg, holder, recs)
+        try:
+            with mock.patch.object(LAB, "keep_state", keep_then_kill), \
+                    mock.patch.object(LAB, "take_unrecorded", take_after_a_second_stop):
+                try:
+                    rc, _inner = self.probe_main_over_run_lab()
+                except LR.SignalAbort:
+                    self.fail("the second stop escaped run_lab and main(): Python would exit 1")
+        finally:
+            signal.signal(signal.SIGTERM, safety)
+        self.assertEqual((rc, asked, seen), (2, [1], []))
+        with open(os.path.join(self.cfg.run_dir, "health.json")) as fh:
+            h = json.load(fh)
+        self.assertEqual(h["verdict"], "INCOMPLETE")
+        self.assertTrue(any("stop signal 15" in p_ for p_ in h["problems"]), h["problems"])
+        self.assertTrue(any("further stop signal" in p_ for p_ in h["problems"]), h["problems"])   # noted
+
+    def test_the_run_levels_first_stop_puts_a_noter_in_before_it_raises(self):
+        """The one-shot itself: after the first stop has raised, the handlers in place only note."""
+        seen = []
+        safety = signal.signal(signal.SIGTERM, lambda n, f: seen.append(n))
+        try:
+            old = LAB._stop_on_signals()
+            try:
+                with self.assertRaises(LR.SignalAbort):
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    for _ in range(1000):
+                        pass
+                os.kill(os.getpid(), signal.SIGTERM)            # must not raise
+                os.kill(os.getpid(), signal.SIGINT)
+                for _ in range(1000):
+                    pass
+            finally:
+                for sig, h in old.items():
+                    signal.signal(sig, h)
+        finally:
+            signal.signal(signal.SIGTERM, safety)
+
+
+    # --- round 6, finding 4: no stop falls between a round's record and its handler restore ----------------
+    def test_a_stop_from_a_hook_inside_finish_after_it_read_the_teardown_signal_means_b_is_not_claimed(self):
+        """(Finding 4) `_finish` reads `teardown_signal` on its first line; the round's handlers were put back
+        only afterwards. A stop between the two went to the teardown's noter after the read, was never read
+        again, and B was claimed and brought up over it. `_finish` and the restore are now under one signal
+        mask: the stop is delivered when the mask lifts, to the run-level handler."""
+        seen = []
+        safety = signal.signal(signal.SIGTERM, lambda n, f: seen.append(n))
+        proc = self.proc
+
+        def make(cfg, runner, bringup, pkg, run_id):
+            class Hooked(LR.LabRound):
+                def _finish(self, rec, t0):
+                    LR.LabRound._finish(self, rec, t0)          # it has read teardown_signal
+                    if bringup == "A":
+                        os.kill(os.getpid(), signal.SIGTERM)
+            return Hooked(cfg, runner, bringup, pkg, run_id, pid=4242, proc_root=proc, install_signals=True)
+        r = self.ndt_runner()
+        try:
+            rc, doc = LAB.run_lab(self.cfg, r, self.s0, self.cfg.run_dir, "run-x", round_cls=make,
+                                  tutorials_utils="/tutorials/utils", expected_tsv=self.expected,
+                                  b_kwargs=self.fake_time(), log=lambda *a: None)
+        finally:
+            signal.signal(signal.SIGTERM, safety)
+        claims = [c for c in r.calls if c["argv"][:2] == ["ndt", "claim"]]
+        self.assertEqual(len(claims), 1, "B was claimed over the stop")
+        self.assertEqual(seen, [])
+        self.assertEqual([b["id"] for b in doc["bringups"]], ["A"])
+        self.assertEqual((doc["bringups"][0]["down_rc"], doc["bringups"][0]["release_rc"]), (0, 0))
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        self.assertTrue(any("stop signal" in p_ for p_ in doc["problems"]), doc["problems"])
+
+    # --- round 7, finding 1: the mask holds only in the calling thread, so no other thread may take a stop --------
+    def background_thread(self, blocked):
+        """A thread that stays up for the rest of the test, started with the signals in `blocked` blocked in it (a
+        thread inherits the mask of the thread that starts it); the caller's own mask is put back as soon as it is
+        up. Returns the Thread."""
+        import threading
+        up, stop = threading.Event(), threading.Event()
+
+        def work():
+            up.set()
+            stop.wait(120)
+        old = signal.pthread_sigmask(signal.SIG_SETMASK, set(blocked))
+        try:
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+            self.assertTrue(up.wait(10))
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+        self.addCleanup(t.join, 10)
+        self.addCleanup(stop.set)
+        return t
+
+    def lab_with_a_stop_in_finish(self, signum):
+        """The finish-hook test's run, for any of the three stop signals: `signum` comes from a hook inside A's
+        `_finish`, after it read teardown_signal. Returns (rc, doc, runner, what the safety handlers saw)."""
+        import select
+        seen = []
+        safety = {s: signal.signal(s, lambda n, f: seen.append(n)) for s in LAB.STOP_SIGNALS}
+        proc = self.proc
+        # The C-level handler writes the signal's number to the wakeup fd when it runs, in whichever thread the
+        # kernel gave the signal to. Without waiting for it the main thread usually gets through the rest of
+        # `_finish` and the restore before a sleeping thread has been scheduled, and the old code is only
+        # sometimes wrong. A signal held pending (every thread blocks it) never writes: that wait times out.
+        rd, wr = os.pipe()
+        os.set_blocking(rd, False)
+        os.set_blocking(wr, False)
+        old_wakeup = signal.set_wakeup_fd(wr, warn_on_full_buffer=False)
+
+        def make(cfg, runner, bringup, pkg, run_id):
+            class Hooked(LR.LabRound):
+                def _finish(self, rec, t0):
+                    LR.LabRound._finish(self, rec, t0)
+                    if bringup == "A":
+                        os.kill(os.getpid(), signum)
+                        select.select([rd], [], [], 0.5)
+            return Hooked(cfg, runner, bringup, pkg, run_id, pid=4242, proc_root=proc, install_signals=True)
+        r = self.ndt_runner()
+        try:
+            rc, doc = LAB.run_lab(self.cfg, r, self.s0, self.cfg.run_dir, "run-x", round_cls=make,
+                                  tutorials_utils="/tutorials/utils", expected_tsv=self.expected,
+                                  b_kwargs=self.fake_time(), log=lambda *a: None)
+        finally:
+            signal.set_wakeup_fd(old_wakeup)
+            os.close(rd)
+            os.close(wr)
+            for s, h in safety.items():
+                signal.signal(s, h)
+        return rc, doc, r, seen
+
+    def assert_refused_before_any_lab_action(self, rc, doc, r, seen, *needles):
+        claims = [c for c in r.calls if c["argv"][:2] == ["ndt", "claim"]]
+        self.assertEqual(claims, [], "the lab was claimed %d time(s) (bring-ups %s; problems %s) although a thread "
+                                     "could take a stop" % (len(claims), [b["id"] for b in doc["bringups"]],
+                                                            doc["problems"]))
+        self.assertEqual([c["argv"] for c in r.calls if c["argv"][0] == "ndt"], [])
+        self.assertEqual(seen, [])
+        self.assertEqual(doc["bringups"], [])
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        self.assertFalse(os.path.exists(self.cfg.lab_state_path), "something was written for the lab")
+        text = " | ".join(doc["problems"])
+        for n in needles:
+            self.assertIn(n, text)
+
+    def test_a_running_thread_that_does_not_block_sigterm_means_the_lab_is_refused_before_any_claim(self):
+        """(Finding 1) The round's mask blocks the three stop signals in the calling thread only. A stop sent to
+        the process while that mask is up goes to a thread that does not block it, and Python then runs the
+        handler in the main thread, inside the masked region, where it is still the teardown's noter: the stop
+        was read by nothing and B was claimed. The finish-hook test with one extra running thread: run_lab now
+        refuses before it claims, and names the thread."""
+        t = self.background_thread(blocked=())
+        rc, doc, r, seen = self.lab_with_a_stop_in_finish(signal.SIGTERM)
+        self.assert_refused_before_any_lab_action(rc, doc, r, seen, "thread %d" % t.native_id, "SIGTERM")
+
+    def test_a_running_thread_that_does_not_block_sighup_is_refused_too(self):
+        t = self.background_thread(blocked=(signal.SIGTERM, signal.SIGINT))
+        rc, doc, r, seen = self.lab_with_a_stop_in_finish(signal.SIGHUP)
+        self.assert_refused_before_any_lab_action(rc, doc, r, seen, "thread %d" % t.native_id, "SIGHUP")
+
+    def test_a_running_thread_that_does_not_block_sigint_is_refused_too(self):
+        t = self.background_thread(blocked=(signal.SIGTERM, signal.SIGHUP))
+        rc, doc, r, seen = self.lab_with_a_stop_in_finish(signal.SIGINT)
+        self.assert_refused_before_any_lab_action(rc, doc, r, seen, "thread %d" % t.native_id, "SIGINT")
+
+    def test_a_running_thread_started_with_the_three_signals_blocked_does_not_stop_the_run_or_lose_the_stop(self):
+        """The control of the tests above: the same thread, started while the three signals were blocked (as the
+        threads gRPC starts inside the ValueSet trial are). The lab is claimed for A, the stop from the hook is
+        delivered when the round's mask lifts, and B is not claimed over it."""
+        self.background_thread(blocked=LAB.STOP_SIGNALS)
+        rc, doc, r, seen = self.lab_with_a_stop_in_finish(signal.SIGTERM)
+        claims = [c for c in r.calls if c["argv"][:2] == ["ndt", "claim"]]
+        self.assertEqual(len(claims), 1, "B was claimed over the stop, or A was refused")
+        self.assertEqual(seen, [])
+        self.assertEqual([b["id"] for b in doc["bringups"]], ["A"])
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        self.assertTrue(any("stop signal" in p_ for p_ in doc["problems"]), doc["problems"])
+        self.assertFalse(any("refused" in p_ for p_ in doc["problems"]), doc["problems"])
+
+    def fake_tasks(self, threads):
+        """A stand-in for /proc/self/task: {tid: the status file's text, or None for a thread with no status file}."""
+        import threading
+        top = os.path.join(self.tmp, "fake-task")
+        shutil.rmtree(top, ignore_errors=True)
+        os.makedirs(top)
+        threads = dict(threads)
+        threads.setdefault(threading.get_native_id(), "Name:\tmain\nSigBlk:\t0000000000000000\n")
+        for tid, text in threads.items():
+            os.makedirs(os.path.join(top, str(tid)))
+            if text is not None:
+                with open(os.path.join(top, str(tid), "status"), "w") as fh:
+                    fh.write(text)
+        return top
+
+    ALL_THREE = "Name:\tw\nSigBlk:\t0000000000004003\n"
+
+    def test_the_calling_thread_is_not_judged_and_threads_that_block_all_three_signals_pass(self):
+        top = self.fake_tasks({910001: self.ALL_THREE, 910002: "Name:\tw\nSigBlk:\tffffffffffffffff\n"})
+        with mock.patch.object(LAB, "PROC_TASK", top):
+            rc, doc, r = self.run_lab()
+        self.assertEqual((doc["verdict"], rc), ("COMPLETE", 0))
+
+    def test_a_thread_with_only_two_of_the_three_bits_set_is_named_in_the_refusal(self):
+        top = self.fake_tasks({910001: self.ALL_THREE, 910002: "Name:\tw\nSigBlk:\t0000000000000003\n"})
+        with mock.patch.object(LAB, "PROC_TASK", top):
+            rc, doc, r = self.run_lab()
+        self.assert_refused_before_any_lab_action(rc, doc, r, [], "910002", "SIGTERM")
+        self.assertNotIn("910001", " ".join(doc["problems"]))
+
+    def test_every_thread_that_does_not_block_them_is_named(self):
+        top = self.fake_tasks({910001: "Name:\tw\nSigBlk:\t0000000000000000\n", 910002: "Name:\tw\nSigBlk:\t0000000000004002\n"})
+        with mock.patch.object(LAB, "PROC_TASK", top):
+            rc, doc, r = self.run_lab()
+        self.assert_refused_before_any_lab_action(rc, doc, r, [], "910001", "910002")
+
+    def test_a_proc_that_cannot_be_read_is_a_refusal_not_a_pass(self):
+        with mock.patch.object(LAB, "PROC_TASK", os.path.join(self.tmp, "no-such-proc", "task")):
+            rc, doc, r = self.run_lab()
+        self.assert_refused_before_any_lab_action(rc, doc, r, [], "no-such-proc")
+
+    def test_a_thread_whose_status_cannot_be_read_or_has_no_sigblk_line_is_a_refusal(self):
+        for text in (None, "Name:\tw\nState:\tS (sleeping)\n", "Name:\tw\nSigBlk:\tnot-hex\n"):
+            shutil.rmtree(os.path.join(self.cfg.run_dir, "frozen"), ignore_errors=True)     # a freeze writes only what is new
+            top = self.fake_tasks({910003: text})
+            with mock.patch.object(LAB, "PROC_TASK", top):
+                rc, doc, r = self.run_lab()
+            self.assert_refused_before_any_lab_action(rc, doc, r, [], "910003")
+
+    def test_a_round_cut_off_before_its_record_was_finished_is_not_complete_in_health_json(self):
+        """(Finding 4, the NIT) A first stop between the end of the body and the swap in `_handlers(False)`
+        raises inside the `finally`: the teardown and `_finish` never run, and the record lab.py takes still
+        said complete (set at the end of the body) with down_rc and release_rc None."""
+        seen = []
+        safety = signal.signal(signal.SIGTERM, lambda n, f: seen.append(n))
+        proc = self.proc
+
+        def make(cfg, runner, bringup, pkg, run_id):
+            class Early(LR.LabRound):
+                def _handlers(self, on):
+                    if not on and bringup == "A":
+                        os.kill(os.getpid(), signal.SIGTERM)    # the body is done; its raiser is still in
+                    LR.LabRound._handlers(self, on)
+            return Early(cfg, runner, bringup, pkg, run_id, pid=4242, proc_root=proc, install_signals=True)
+        try:
+            rc, doc = LAB.run_lab(self.cfg, self.ndt_runner(), self.s0, self.cfg.run_dir, "run-x", round_cls=make,
+                                  tutorials_utils="/tutorials/utils", expected_tsv=self.expected,
+                                  b_kwargs=self.fake_time(), log=lambda *a: None)
+        finally:
+            signal.signal(signal.SIGTERM, safety)
+        a = doc["bringups"][0]
+        self.assertEqual((a["id"], a["down_rc"], a["release_rc"]), ("A", None, None))
+        self.assertFalse(a["complete"])
+        self.assertTrue(any("cut off" in p_ for p_ in a["problems"]), a["problems"])
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+
+
+    # --- round 6, finding 5: observations.json first, health.json last, each through tmp + replace --------------
+    def main_over_run_lab_capturing_stderr(self, log=None):
+        import io
+        from p4_health import probe
+        err = io.StringIO()
+
+        def cmd_lab(args):
+            rc, _doc = LAB.run_lab(self.cfg, self.ndt_runner(), self.s0, self.cfg.run_dir, "run-x",
+                                   round_cls=self.rounds(), tutorials_utils="/tutorials/utils",
+                                   expected_tsv=self.expected, a_kwargs={"hosts": None},
+                                   b_kwargs=self.fake_time(), log=log or (lambda *a: None))
+            return rc
+        with mock.patch.object(probe, "cmd_lab", cmd_lab), mock.patch("sys.stderr", err):
+            rc = probe.main(["lab", "--run-dir", self.cfg.run_dir, "--owner", "o"])
+        return rc, err.getvalue()
+
+    def failing_open(self, name):
+        """open() as lab/report see it, failing (ENOSPC) for a file whose name starts with `name` when it is
+        opened for writing: the file itself or the temp file it goes through."""
+        import errno
+        import builtins
+        real = builtins.open
+
+        def opener(file, mode="r", *a, **kw):
+            if "w" in mode and os.path.basename(str(file)).startswith(name):
+                raise OSError(errno.ENOSPC, "No space left on device", str(file))
+            return real(file, mode, *a, **kw)
+        return mock.patch("builtins.open", opener)
+
+    def failing_replace(self, name):
+        """os.replace as lab/report see it, failing (ENOSPC) for the file called `name`."""
+        import errno
+        real = os.replace
+
+        def replace(src, dst, *a, **kw):
+            if os.path.basename(str(dst)) == name:
+                raise OSError(errno.ENOSPC, "No space left on device", str(dst))
+            return real(src, dst, *a, **kw)
+        return mock.patch("os.replace", replace)
+
+    def assert_no_verdict_left(self, rc, err):
+        self.assertEqual(rc, 2)
+        self.assertIn("Traceback", err)
+        self.assertIn("No space left on device", err)
+        self.assertEqual([f for f in os.listdir(self.cfg.run_dir)
+                          if f.startswith("health.json") or f.startswith("observations.json")], [])
+
+    def test_an_error_writing_observations_json_leaves_no_health_json_and_exits_2(self):
+        """run_lab wrote health.json (the verdict) first and observations.json after it: an OSError on the
+        second (ENOSPC is the likely one) left a health.json with a verdict next to rc 2 and "refused: ...
+        not a verdict". The verdict file is now the LAST thing written."""
+        with self.failing_open("observations.json"):
+            rc, err = self.main_over_run_lab_capturing_stderr()
+        self.assert_no_verdict_left(rc, err)
+
+    def test_an_error_putting_observations_json_in_place_leaves_no_health_json_and_exits_2(self):
+        """The same when the temp file was written and the os.replace is what fails."""
+        with self.failing_replace("observations.json"):
+            rc, err = self.main_over_run_lab_capturing_stderr()
+        self.assert_no_verdict_left(rc, err)
+
+    def test_the_catch_all_does_not_look_like_a_deliberate_refusal(self):
+        """Since round 5 the tests told a crash from a refusal by the word "Traceback" alone; the crash message
+        also began with `refused:`, the prefix of the deliberate refusals."""
+        with self.failing_open("observations.json"):
+            _rc, err = self.main_over_run_lab_capturing_stderr()
+        self.assertFalse(any(line.startswith("refused:") for line in err.splitlines()), err)
+
+    def test_an_error_after_health_json_was_written_sets_it_aside_as_not_a_verdict(self):
+        """An exception once the verdict file is on disk (here the log call that prints the table) still ends
+        the run rc 2: the file, which would read as a verdict, is renamed, and the message says so."""
+        def log(line, *a):
+            if str(line).startswith("verdict "):            # run_lab's last words, after both files are on disk
+                raise OSError(5, "Input/output error")
+        rc, err = self.main_over_run_lab_capturing_stderr(log=log)
+        self.assertEqual(rc, 2)
+        run = self.cfg.run_dir
+        self.assertFalse(os.path.exists(os.path.join(run, "health.json")))
+        aside = os.path.join(run, "health.json.not-a-verdict")
+        self.assertTrue(os.path.exists(aside), os.listdir(run))
+        self.assertIn("health.json.not-a-verdict", err)
+        with open(aside) as fh:
+            self.assertIn("verdict", json.load(fh))
+
+    def test_a_write_that_fails_half_way_leaves_the_earlier_file_whole(self):
+        """report.dump goes through a temp file and os.replace: a dump that dies half-way neither truncates
+        the file that was there nor leaves the temp file behind."""
+        import errno
+        from p4_health import report as R
+        target = os.path.join(self.tmp, "health.json")
+        with open(target, "w") as fh:
+            fh.write('{"old": 1}\n')
+
+        def dump(doc, fh, **kw):
+            fh.write("{\"half\": ")
+            raise OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(R.json, "dump", dump):
+            with self.assertRaises(OSError):
+                R.dump(target, {"new": 2})
+        with open(target) as fh:
+            self.assertEqual(json.load(fh), {"old": 1})
+        self.assertEqual([f for f in os.listdir(self.tmp) if f.startswith("health.json") and f != "health.json"], [])
+
+
+    # --- round 6, finding 10: what run_lab writes, `probe.py judge` reads back to the same answer --------------
+    def judged_again(self, doc):
+        """`probe.py judge` over the observations.json this harness's run_lab just wrote. Returns (rc, health)."""
+        import io
+        from contextlib import redirect_stdout
+        from p4_health import probe
+        out = os.path.join(self.tmp, "judged-again")
+        # probe_version asks git for the probe's tree: the sealed suite spawns nothing, and it is no part of the answer
+        with redirect_stdout(io.StringIO()), mock.patch.object(probe, "probe_version", lambda head=None: "tree"):
+            rc = probe.main(["judge", "--observations", os.path.join(self.cfg.run_dir, "observations.json"),
+                             "--run-dir", out, "--expected", self.expected])
+        with open(os.path.join(out, "health.json")) as fh:
+            return rc, json.load(fh)
+
+    def assert_the_same_answer_offline(self, rc, doc):
+        rc2, h2 = self.judged_again(doc)
+        self.assertEqual((h2["verdict"], rc2), (doc["verdict"], rc))
+        live = {c["id"]: (c["verdict"], c["reason"], c["delta"]) for c in doc["cells"] + doc["controls"]}
+        again = {c["id"]: (c["verdict"], c["reason"], c["delta"]) for c in h2["cells"] + h2["controls"]}
+        self.assertEqual(again, live)
+        self.assertEqual(h2["rollup"], json.loads(json.dumps(doc["rollup"], default=sorted)))
+
+    def test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells(self):
+        """(Finding 10) run_lab -> observations.json -> `probe.py judge`. After the JSON round trip the tuples
+        and sets are lists: t1 called set() on lists of lists (TypeError), and m1, m2, c1 compared a list with
+        a frozenset (always unequal: three cells silently RED). Hand-built recordings never showed it."""
+        rc, doc, _r = self.run_lab()
+        self.assertEqual((doc["verdict"], rc), ("COMPLETE", 0))
+        self.assert_the_same_answer_offline(rc, doc)
+
+    def test_a_see_red_runs_observations_judge_offline_to_the_same_headline_and_cells(self):
+        self.fab.count_k1 = False
+        self.fab.ttl_decrements = False
+        rc, doc, _r = self.run_lab(bringups=("A",), only=["K1", "TTL1"], mutant=True)
+        self.assertEqual((doc["verdict"], rc), ("PROBE-BROKEN", 1))
+        self.assert_the_same_answer_offline(rc, doc)
+
+    def test_a_stopped_runs_observations_judge_offline_to_the_same_headline_and_cells(self):
+        self.fab.count_k1 = False
+        self.fab.signal_in_sniffer = "TTL1"
+        rc, doc, _r = self.run_lab()
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        self.assert_the_same_answer_offline(rc, doc)
 
 
 if __name__ == "__main__":

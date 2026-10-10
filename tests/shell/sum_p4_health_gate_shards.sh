@@ -4,7 +4,7 @@
 #
 # [Co-developed with claude code -- Adam]
 #
-#   tests/shell/sum_p4_health_gate_shards.sh <shard log>...
+#   tests/shell/sum_p4_health_gate_shards.sh [--commit <sha>] <shard log>...
 #
 # One shard (MUT_SHARD=k/n) is never the gate by itself: its rc=0 says only that the mutations IT ran were
 # caught. The gate is the n shards of one head together, so this checks, over the logs given:
@@ -16,18 +16,39 @@
 #   * all of them share one commit (the first line, and the HEAD line), one tools/p4_health tree (and none says
 #     UNCOMMITTED) and one subject sha;
 #   * they agree on n and on L, n is not larger than L, the shards are exactly 0..n-1 once each, each ran its
-#     share of the table (the positions k, k+n, ... below L) and the shares add up to L.
+#     share of the table (the positions k, k+n, ... below L) and the shares add up to L;
+#   * (round 6) the commit they share is the checkout's HEAD -- or, with --commit, the commit named there -- and
+#     the tools/p4_health tree they share is that commit's tree: logs of another commit certify nothing about
+#     this one. The checkout is this script's own (../..), or $P4_HEALTH_SUM_REPO. The subject sha is a hash of
+#     the working files, which a commit does not fix, so it is compared between the logs only, and printed.
 #
 # Only then it prints the one line
-#   GATE: <N> mutations, <S> survived, shards <k>/<n> ok
+#   GATE: <N> mutations, <S> survived, shards <k>/<n> ok, commit <sha>, tree <sha>, subject sha <16 hex>
 # and exits 0. Anything else prints `NOT THE GATE: <why>` (one line per reason) and exits 1.
 set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export P4H_SUM_REPO="${P4_HEALTH_SUM_REPO:-$(cd "$HERE/../.." && pwd)}"
 exec "${PYTHON:-python3}" - "$@" <<'PY'
+import os
 import re
+import subprocess
 import sys
 
-logs = sys.argv[1:]
 problems = []
+logs = []
+commit_arg = None
+args = sys.argv[1:]
+while args:
+    a = args.pop(0)
+    if a == "--commit":
+        if not args:
+            problems.append("--commit needs a commit")
+        else:
+            commit_arg = args.pop(0)
+    elif a.startswith("--"):
+        problems.append("unknown option %s" % a)
+    else:
+        logs.append(a)
 
 
 def bad(why):
@@ -137,10 +158,46 @@ if facts:
                 bad("%s: shard %d/%d ran %d mutations, its share of %d is %d: the counts do not add up"
                     % (f["path"], f["k"], n, f["m"], labels, share))
 
+
+def git(*a):
+    """(rc, stdout) of one git call in the checkout; rc None when git could not run."""
+    try:
+        res = subprocess.run(["git", "-C", repo] + list(a), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    return res.returncode, res.stdout.strip()
+
+
+repo = os.environ["P4H_SUM_REPO"]
+if facts and len({f["commit"] for f in facts}) == 1 and len({f["tree"] for f in facts}) == 1:
+    commit, tree = facts[0]["commit"], facts[0]["tree"]
+    h_rc, head = git("rev-parse", "--verify", "HEAD^{commit}")
+    want, what = head, "the checkout's HEAD"
+    if h_rc != 0 or not head:
+        bad("git could not name HEAD in %s: the logs are certified by nothing" % repo)
+        want = None
+    if commit_arg is not None:
+        c_rc, given = (None, "") if commit_arg.startswith("-") else git("rev-parse", "--verify", commit_arg + "^{commit}")
+        if c_rc != 0 or not given:
+            bad("--commit %s is not a commit of %s" % (commit_arg, repo))
+            want = None
+        else:
+            want, what = given, "--commit %s" % commit_arg
+    if want is not None:
+        if commit != want:
+            bad("the logs are of commit %s, which is not %s (%s)" % (commit, what, want))
+        t_rc, want_tree = git("rev-parse", "--verify", want + ":tools/p4_health")
+        if t_rc != 0 or not want_tree:
+            bad("git could not name tools/p4_health at %s" % want)
+        elif tree != want_tree:
+            bad("the logs' tools/p4_health tree %s is not the tree of %s (%s)" % (tree, want, want_tree))
+
 if problems:
     for p in problems:
         print("NOT THE GATE: %s" % p)
     sys.exit(1)
-print("GATE: %d mutations, %d survived, shards %d/%d ok"
-      % (sum(f["m"] for f in facts), sum(f["s"] for f in facts), len(facts), facts[0]["n"]))
+print("GATE: %d mutations, %d survived, shards %d/%d ok, commit %s, tree %s, subject sha %s"
+      % (sum(f["m"] for f in facts), sum(f["s"] for f in facts), len(facts), facts[0]["n"],
+         facts[0]["commit"], facts[0]["tree"], facts[0]["subj"]))
 PY

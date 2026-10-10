@@ -1519,8 +1519,30 @@ class TestS0Pieces(unittest.TestCase):
 
 # --- Cut 2 -----------------------------------------------------------------------------------------
 
+def _clear_the_stop_mask():
+    """The three stop signals unblocked, any that were pending going to handlers that do nothing; the handlers
+    that were in place are put back. Used at the start and at the end of a test that changes the mask."""
+    import signal
+    stops = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    old = {s: signal.signal(s, lambda n, f: None) for s in stops}
+    try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
+        for _ in range(2000):
+            pass
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+
+
 class TestS0Cut2Checks(unittest.TestCase):
     """m5: S0's two new safety checks decide something, so each is pinned."""
+
+    def setUp(self):
+        # (round 7) The tests of the ValueSet trial compare the signal mask before and after it. A mutant that never
+        # lifts the trial's block leaves the mask blocked for every test after the first, and a test that starts
+        # with the block already up cannot see it not being lifted: each starts, and ends, with the mask clear.
+        _clear_the_stop_mask()
+        self.addCleanup(_clear_the_stop_mask)
 
     def s0(self, replies):
         import tempfile
@@ -1659,6 +1681,214 @@ class TestS0Cut2Checks(unittest.TestCase):
             self.assertEqual(argvs[-1], ["py-ctrl", want])
 
 
+    # --- round 6, finding 2: the controller trial loads the model from the run's exercise copy ------------
+    def test_the_controller_trial_loads_the_model_from_the_runs_exercise_copy_not_the_shared_tree(self):
+        """S0 copies `exercise/` into the run dir (`self.ex`) and every later step runs that copy; the
+        controller trial exec'd the SHARED tree's gen_runtime.py instead (ctrl_trial.gen, HERE/exercise),
+        minutes after the clean check. Here the copy's gen_runtime.py differs from the tree's in one
+        value (the CPU port): the throwaway switch must be started with the COPY's."""
+        import shutil
+        from unittest import mock
+        from p4_health import ctrl_trial as CT
+        x, _r = self.s0([])
+        shutil.copytree(os.path.join(os.path.dirname(PKG), "exercise"), x.ex,
+                        ignore=shutil.ignore_patterns("__pycache__", "build*"))
+        with open(os.path.join(x.ex, "gen_runtime.py"), "a") as fh:
+            fh.write("\nCPU_PORT = 4242  # the copy's, not the tree's\n")
+
+        class Stop(BaseException):
+            pass
+        seen = []
+
+        class FakeSwitch(object):
+            def __init__(self, *a, **kw):
+                seen.append(a[2])               # Throwaway(json, inputs, cpu_port, ...)
+                self.workdir, self.grpc_port, self.started_at = kw.get("workdir"), 29650, 0
+
+            def start(self):
+                pass
+
+            def stop(self):
+                return 0
+
+        def popen(argv, **kw):
+            raise Stop()
+        with mock.patch.object(CT.TW, "Throwaway", FakeSwitch), mock.patch.object(CT.subprocess, "Popen", popen), \
+                mock.patch("p4_health.vs_trial.fabric_binary", return_value="/y/bin/simple_switch_grpc"):
+            with self.assertRaises(Stop):
+                x.ctrl_trial()
+        self.assertEqual(seen, [4242])
+
+    def test_the_controller_trial_without_an_exercise_dir_uses_the_trees_model(self):
+        """The control of the test above: trial() called without an exercise directory (S0 on its own is
+        not the lab run's concern) still loads the tree's own gen_runtime.py."""
+        import tempfile
+        from unittest import mock
+        from p4_health import ctrl_trial as CT
+
+        class Stop(BaseException):
+            pass
+        seen = []
+
+        class FakeSwitch(object):
+            def __init__(self, *a, **kw):
+                seen.append(a[2])
+                self.workdir, self.grpc_port, self.started_at = kw.get("workdir"), 29650, 0
+
+            def start(self):
+                pass
+
+            def stop(self):
+                return 0
+
+        def popen(argv, **kw):
+            raise Stop()
+        d = tempfile.mkdtemp(prefix="p4h-ctrltrial-gen-%d-" % os.getpid())
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        with mock.patch.object(CT.TW, "Throwaway", FakeSwitch), mock.patch.object(CT.subprocess, "Popen", popen):
+            with self.assertRaises(Stop):
+                CT.trial(os.path.join(d, "build"), "/x/bmv2", ["cli"], os.path.join(d, "work"), "py-ctrl",
+                         "/tutorials/utils")
+        self.assertEqual(seen, [510])
+
+    # --- round 7, finding 1: the ValueSet trial runs gRPC in this process; the threads it starts must block the stops --
+    def stops(self):
+        import signal
+        return (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+    def run_vs_trial_with(self, trial):
+        """S0.vs_trial with VT.trial replaced by `trial`. Returns the S0."""
+        from unittest import mock
+        x, _r = self.s0([])
+        with mock.patch("p4_health.vs_trial.trial", trial), \
+                mock.patch("p4_health.vs_trial.fabric_binary", return_value="/y/bin/simple_switch_grpc"):
+            x.vs_trial()
+        return x
+
+    def test_the_valueset_trial_is_entered_with_the_three_stop_signals_blocked_and_the_mask_is_put_back(self):
+        import signal
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        inside = []
+
+        def trial(build, bmv2, cli, work):
+            inside.append(signal.pthread_sigmask(signal.SIG_BLOCK, ()))
+            return {"bmv2": bmv2, "alive_after_write": True, "alive_after_read": True, "write_errors": [{"canonical_code": 12}]}
+        self.run_vs_trial_with(trial)
+        self.assertEqual(len(inside), 2)                    # the stock build and the fabric's
+        for mask in inside:
+            self.assertTrue(set(self.stops()) <= set(mask), mask)
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, ()), before)
+
+    def test_the_mask_is_put_back_when_the_trial_raises_and_the_failure_is_still_recorded(self):
+        import signal
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        inside = []
+
+        def trial(build, bmv2, cli, work):
+            inside.append(signal.pthread_sigmask(signal.SIG_BLOCK, ()))
+            raise RuntimeError("the trial broke")
+        x = self.run_vs_trial_with(trial)
+        self.assertTrue(inside and set(self.stops()) <= set(inside[0]))
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, ()), before)
+        self.assertFalse(x.out["checks"][-1]["ok"])
+        self.assertIn("the trial broke", x.out["checks"][-1]["detail"])
+
+    def test_a_thread_started_inside_the_trial_blocks_the_three_stop_signals(self):
+        """What gRPC does inside the trial: starts threads that outlive it. A thread inherits the mask of the
+        thread that starts it, so it blocks the stops for good; one started outside the trial would not."""
+        import threading
+        kept, stop = [], threading.Event()
+        self.addCleanup(lambda: [stop.set()] + [t.join(10) for t in kept])
+
+        def trial(build, bmv2, cli, work):
+            t = threading.Thread(target=stop.wait, args=(120,), daemon=True)
+            t.start()
+            kept.append(t)
+            return {"bmv2": bmv2, "alive_after_write": True, "alive_after_read": True, "write_errors": [{"canonical_code": 12}]}
+        self.run_vs_trial_with(trial)
+        self.assertTrue(kept)
+        for t in kept:
+            with open("/proc/self/task/%d/status" % t.native_id) as fh:
+                blk = int([l for l in fh if l.startswith("SigBlk:")][0].split()[1], 16)
+            for s in self.stops():
+                self.assertTrue(blk & (1 << (s - 1)), "%s is not blocked in thread %d (SigBlk %x)" % (s.name, t.native_id, blk))
+
+    def test_a_stop_that_arrives_during_the_trial_waits_and_is_delivered_when_the_mask_is_put_back(self):
+        import signal
+        in_trial, seen_inside, seen_after = [True], [], []
+        old = {s: signal.signal(s, lambda n, f: (seen_inside if in_trial[0] else seen_after).append(n))
+               for s in self.stops()}
+
+        def trial(build, bmv2, cli, work):
+            in_trial[0] = True
+            for s in self.stops():
+                os.kill(os.getpid(), s)
+            for _ in range(2000):
+                pass                                        # the handlers would run here, if they could
+            in_trial[0] = False
+            return {"bmv2": bmv2, "alive_after_write": True, "alive_after_read": True, "write_errors": [{"canonical_code": 12}]}
+        try:
+            self.run_vs_trial_with(trial)
+            for _ in range(2000):
+                pass
+        finally:
+            for s, h in old.items():
+                signal.signal(s, h)
+        self.assertEqual(seen_inside, [])
+        # delivered once the trial is over (the first call's stops arrive when the mask is put back after both
+        # calls: the mask covers the whole trial), none lost
+        self.assertEqual(sorted(set(seen_after)), sorted(int(s) for s in self.stops()))
+
+    def test_a_stop_during_the_trial_ends_an_unhandled_process_only_after_the_trial_is_over(self):
+        """The S0 stage has no handler of its own: a SIGTERM kills the process. During the trial it must wait for the
+        trial to finish (a trial killed in the middle leaves its throwaway switch to the parent-death signal), and
+        then kill it all the same -- the stop is held, not dropped."""
+        import tempfile
+        d = tempfile.mkdtemp(prefix="p4h-vs-stop-%d-" % os.getpid())
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        tools = os.path.dirname(os.path.dirname(PKG))
+        code = (
+            "import os, signal, sys\n"
+            "from unittest import mock\n"
+            "sys.path.insert(0, %r)\n"
+            "from p4_health import s0 as S0M\n"
+            "from p4_health.collect.runner import RecordingRunner\n"
+            "def trial(build, bmv2, cli, work):\n"
+            "    os.kill(os.getpid(), signal.SIGTERM)\n"
+            "    for _ in range(200000):\n"
+            "        pass\n"
+            "    open(%r, 'w').write('the trial ran to its end')\n"
+            "    return {'bmv2': bmv2, 'alive_after_write': True, 'alive_after_read': True,\n"
+            "            'write_errors': [{'canonical_code': 12}]}\n"
+            "x = S0M.S0(%r, RecordingRunner([]), 'py', log=lambda *a: None)\n"
+            "with mock.patch('p4_health.vs_trial.trial', trial), \\\n"
+            "        mock.patch('p4_health.vs_trial.fabric_binary', return_value='/y/b'):\n"
+            "    x.vs_trial()\n"
+            "open(%r, 'w').write('the process outlived the stop')\n"
+            % (tools, os.path.join(d, "inside"), d, os.path.join(d, "after")))
+        res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+        import signal
+        self.assertEqual(res.returncode, -signal.SIGTERM, res.stderr[-800:])
+        self.assertTrue(os.path.exists(os.path.join(d, "inside")), "the stop killed the trial in the middle")
+        self.assertFalse(os.path.exists(os.path.join(d, "after")))
+
+    def test_a_throwaway_switch_does_not_inherit_the_blocked_stops(self):
+        """The mask is inherited across exec: a switch started inside the trial with SIGTERM blocked would ignore
+        Throwaway.stop()'s terminate() and be killed only after its 3 s timeout. The child clears the three before exec."""
+        import signal
+        from p4_health import throwaway as TW
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, self.stops())
+        try:
+            proc = subprocess.run([sys.executable, "-c", "print([l for l in open('/proc/self/status') if l.startswith('SigBlk')][0])"],
+                                  capture_output=True, text=True, timeout=60, preexec_fn=TW._die_with_parent)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        blk = int(proc.stdout.split()[1], 16)
+        for s in self.stops():
+            self.assertFalse(blk & (1 << (s - 1)), "%s is still blocked in the child (SigBlk %x)" % (s.name, blk))
+
+
 class TestTheLiveRunsIdentity(unittest.TestCase):
     """m4: a lab run refuses a dirty probe, and records the Q6(a) fingerprint and the system
     under test."""
@@ -1692,6 +1922,8 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
                 raise MustNotRun("unexpected spawn %r" % (argv,))
             if exc is not None:
                 raise exc
+            if rc == 0 and not out and "rev-parse" in argv and "--verify" in argv:
+                return sp.CompletedProcess(argv, rc, stdout="ab" * 20 + "\n", stderr="")    # HEAD is a commit
             return sp.CompletedProcess(argv, rc, stdout=out, stderr="")
         return run
 
@@ -1704,6 +1936,30 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
                    {"rc": 0, "exc": FileNotFoundError("git")}):
             with self.subTest(kw=kw):
                 with mock.patch.object(probe.subprocess, "run", self.git_answering(**kw)), \
+                        mock.patch("p4_health.frozen.freeze", side_effect=MustNotRun("the freeze must not start")), \
+                        mock.patch("p4_health.s0.S0", side_effect=MustNotRun("S0 must not start")):
+                    rc = probe.main(["lab", "--run-dir", "/nonexistent/run", "--owner", "o"])
+                self.assertEqual(rc, 2)
+
+    def test_a_git_status_that_cannot_answer_is_refused_before_s0(self):
+        """N3, the clean check's own refusal: HEAD is named (the pin answers), and `git status` then fails, times
+        out or is missing. Not 'clean'. (Since the round-6 pin, the test above is refused at the pin and no longer
+        reaches the status call; this one makes only `status` fail.)"""
+        import subprocess as sp
+        from unittest import mock
+        from p4_health import probe
+
+        def status_fails(kind):
+            def run(argv, **kw):
+                if argv[3:5] == ["rev-parse", "--verify"]:
+                    return sp.CompletedProcess(argv, 0, stdout="ab" * 20 + "\n", stderr="")
+                if kind == "rc":
+                    return sp.CompletedProcess(argv, 128, stdout="", stderr="")
+                raise sp.TimeoutExpired("git", 10) if kind == "timeout" else FileNotFoundError("git")
+            return run
+        for kind in ("rc", "timeout", "missing"):
+            with self.subTest(kind=kind):
+                with mock.patch.object(probe.subprocess, "run", status_fails(kind)), \
                         mock.patch("p4_health.frozen.freeze", side_effect=MustNotRun("the freeze must not start")), \
                         mock.patch("p4_health.s0.S0", side_effect=MustNotRun("S0 must not start")):
                     rc = probe.main(["lab", "--run-dir", "/nonexistent/run", "--owner", "o"])
@@ -1810,6 +2066,22 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("RuntimeError", err.getvalue())
         self.assertIn("S0 fell over", err.getvalue())
+
+    def test_a_stop_that_gets_out_of_the_lab_path_is_rc_2_stopped_not_pythons_status_1(self):
+        """(Round 6, finding 3) SignalAbort is a BaseException: main() caught only Exception, so a stop that
+        reached the run level outside run_lab's try (between the handler install and the try) left the
+        process as an uncaught exception -- status 1, the see-red run's pass, and no health.json."""
+        import io
+        from unittest import mock
+        from p4_health import probe
+        from p4_health.lab_round import SignalAbort
+        err = io.StringIO()
+        with mock.patch.object(probe, "cmd_lab", side_effect=SignalAbort(15)), mock.patch("sys.stderr", err):
+            rc = probe.main(["lab", "--run-dir", "/nonexistent/run", "--owner", "o"])
+        self.assertEqual(rc, 2)
+        self.assertIn("stopped", err.getvalue())
+        self.assertIn("INCOMPLETE", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
 
     # --- round 4, F8: an unreadable bmv2 override, with the REAL fingerprint ------------------
     def readable_machine(self, frozen=None):
@@ -2366,7 +2638,10 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         the controller records), and the files of everything loaded are listed at exit, with
         `p4_health.frames` resolved the way the controller's lazy import would resolve it. The frozen
         launch loads nothing from the shared tree; the same launch of the shared tree's files does (the
-        control: the detector is live)."""
+        control: the detector is live).
+        Note what "as B launches them" covers: the argv's shape. The interpreter here is `sys.executable`; B
+        starts the p4dev interpreter (round_b.py:119, `cfg.p4dev_python`). The files loaded are the same ones
+        only as long as the two interpreters import the same things from the same places."""
         import json
         import shutil
         import tempfile
@@ -2483,6 +2758,378 @@ class TestTheLiveRunsIdentity(unittest.TestCase):
         self.assertNotEqual(fp(), base)
         whole = ID.fingerprint(r, d, d, ["/no/python"], ntg=os.path.join(d, "no-ntg"))
         self.assertEqual(whole["sha256"], "incomplete")          # an unread part is not a match
+
+
+    # --- round 6, finding 2: S0's exercise copy is checked against the pinned commit --------------------
+    def repo_with_exercise(self):
+        """The scratch repo of the freeze tests, plus the package's own exercise/ tree, committed."""
+        import shutil
+        repo = self.scratch_repo()
+        shutil.copytree(os.path.join(os.path.dirname(PKG), "exercise"),
+                        os.path.join(repo, "tools", "p4_health", "exercise"),
+                        ignore=shutil.ignore_patterns("__pycache__", "build*"))
+        self.git_in(repo, "add", ".")
+        self.git_in(repo, "commit", "-q", "-m", "exercise")
+        return repo
+
+    def lab_with_the_real_s0(self, repo, edit_after_status=None):
+        """probe.py lab in `repo` with the REAL S0 class: its p4c calls all fail (nothing is compiled), the
+        steps after them are stubs, and `run_lab` is a marker. `edit_after_status` runs right after the
+        clean check answered -- an edit that lands before S0 copies `exercise/`. Returns (rc, run_lab
+        reached?, stderr, run dir)."""
+        import contextlib
+        import io
+        import tempfile
+        import types
+        from unittest import mock
+        from p4_health import probe
+        from p4_health import s0 as S0M
+
+        class Reached(BaseException):
+            pass
+
+        def run_lab(*a, **kw):
+            raise Reached()
+        real, edits = probe._git_run, []
+
+        def git(*args):
+            out = real(*args)
+            if args[0] == "status" and edit_after_status and not edits:
+                edits.append(1)                 # once: the clean check's own status call
+                edit_after_status()
+            return out
+        run_dir = tempfile.mkdtemp(prefix="p4h-ex-run-%d-" % os.getpid())
+        self.addCleanup(__import__("shutil").rmtree, run_dir, True)
+        err, reached = io.StringIO(), False
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(probe, "REPO", repo))
+            stack.enter_context(mock.patch.object(probe, "_git_run", git))
+            stack.enter_context(mock.patch.object(S0M, "EXERCISE", os.path.join(repo, "tools", "p4_health",
+                                                                                 "exercise")))
+            stack.enter_context(mock.patch.object(
+                S0M.S0, "run_cmd", lambda self, argv, **kw: types.SimpleNamespace(rc=1, stdout="", stderr="")))
+            for step in ("identity", "openapi", "pft_verdict"):
+                stack.enter_context(mock.patch.object(S0M.S0, step, lambda self: None))
+            stack.enter_context(mock.patch("p4_health.lab.run_lab", run_lab))
+            stack.enter_context(mock.patch("sys.stderr", err))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            try:
+                rc = probe.main(["lab", "--run-dir", run_dir, "--owner", "o"])
+            except Reached:
+                rc, reached = None, True
+        return rc, reached, err.getvalue(), run_dir
+
+    def test_an_exercise_tree_that_is_what_the_commit_has_goes_on_to_the_lab(self):
+        """The control of the next tests: no edit, S0 copies exercise/ (the p4c builds leave build*/
+        directories beside it, and a __pycache__ may be there) and the run reaches run_lab."""
+        repo = self.repo_with_exercise()
+        rc, reached, err, _run = self.lab_with_the_real_s0(repo)
+        self.assertTrue(reached, (rc, err))
+        self.assertNotIn("refused", err)
+
+    def test_an_exercise_file_edited_after_the_clean_check_is_refused_before_any_lab_action(self):
+        """(Finding 2) The freeze checks seven files; `exercise/` is copied by S0 a little later and feeds
+        every expectation the lab run judges by (lab.load_model, s0's own model, the controller trial). An
+        edit that lands between the clean check and that copy used to be run, not refused."""
+        repo = self.repo_with_exercise()
+
+        def edit():
+            with open(os.path.join(repo, "tools", "p4_health", "exercise", "gen_runtime.py"), "a") as fh:
+                fh.write("\nCPU_PORT = 4242  # nobody committed this\n")
+        rc, reached, err, run = self.lab_with_the_real_s0(repo, edit_after_status=edit)
+        self.assert_refused_cleanly(rc, reached, err)
+        self.assertIn("gen_runtime.py", err)
+        self.assertFalse(os.path.exists(os.path.join(run, "s0.json")))
+
+    def test_an_exercise_file_that_was_not_there_when_the_commit_was_made_is_refused(self):
+        repo = self.repo_with_exercise()
+
+        def add():
+            with open(os.path.join(repo, "tools", "p4_health", "exercise", "extra_model.py"), "w") as fh:
+                fh.write("# a new file nobody committed\n")
+        rc, reached, err, _run = self.lab_with_the_real_s0(repo, edit_after_status=add)
+        self.assert_refused_cleanly(rc, reached, err)
+        self.assertIn("extra_model.py", err)
+
+    def test_an_exercise_file_that_went_missing_after_the_clean_check_is_refused(self):
+        repo = self.repo_with_exercise()
+
+        def delete():
+            os.remove(os.path.join(repo, "tools", "p4_health", "exercise", "runtime", "s2-runtime.json"))
+        rc, reached, err, _run = self.lab_with_the_real_s0(repo, edit_after_status=delete)
+        self.assert_refused_cleanly(rc, reached, err)
+        self.assertIn("s2-runtime.json", err)
+
+    def freeze_with_exercise(self):
+        """(Frozen, a copy of the committed exercise/ tree); the freeze's git is probe.py's own, which asks
+        probe.REPO -- the scratch repo, for as long as the test keeps it patched (patched_repo)."""
+        import shutil
+        import tempfile
+        from unittest import mock
+        from p4_health import probe
+        repo = self.repo_with_exercise()
+        patch = mock.patch.object(probe, "REPO", repo)
+        patch.start()
+        self.addCleanup(patch.stop)
+        fz, _run = self.freeze_in(repo)
+        copy = os.path.join(tempfile.mkdtemp(prefix="p4h-excopy-%d-" % os.getpid()), "exercise")
+        self.addCleanup(shutil.rmtree, os.path.dirname(copy), True)
+        shutil.copytree(os.path.join(repo, "tools", "p4_health", "exercise"), copy)
+        return fz, copy
+
+    def test_the_exercise_copy_check_passes_for_the_tree_the_commit_has_and_ignores_build_output(self):
+        fz, copy = self.freeze_with_exercise()
+        os.makedirs(os.path.join(copy, "build"))
+        with open(os.path.join(copy, "build", "hc_main.json"), "w") as fh:
+            fh.write("{}")
+        os.makedirs(os.path.join(copy, "build-mutant"))
+        os.makedirs(os.path.join(copy, "__pycache__"))
+        with open(os.path.join(copy, "__pycache__", "gen_runtime.cpython-313.pyc"), "wb") as fh:
+            fh.write(b"x")
+        fz.check_exercise(copy)
+
+    def test_the_exercise_copy_check_names_the_file_that_differs(self):
+        from p4_health import frozen as FZ
+        fz, copy = self.freeze_with_exercise()
+        with open(os.path.join(copy, "src", "hc_main.p4"), "a") as fh:
+            fh.write("// edited\n")
+        with self.assertRaises(FZ.Refused) as ctx:
+            fz.check_exercise(copy)
+        self.assertIn("src/hc_main.p4", str(ctx.exception))
+        self.assertIn(fz.head, str(ctx.exception))
+
+    def test_the_exercise_copy_check_refuses_a_file_the_commit_does_not_have_and_one_it_lacks(self):
+        from p4_health import frozen as FZ
+        fz, copy = self.freeze_with_exercise()
+        with open(os.path.join(copy, "extra_model.py"), "w") as fh:
+            fh.write("# not committed\n")
+        with self.assertRaises(FZ.Refused) as ctx:
+            fz.check_exercise(copy)
+        self.assertIn("extra_model.py", str(ctx.exception))
+        os.remove(os.path.join(copy, "extra_model.py"))
+        os.remove(os.path.join(copy, "topology.json"))
+        with self.assertRaises(FZ.Refused) as ctx:
+            fz.check_exercise(copy)
+        self.assertIn("topology.json", str(ctx.exception))
+
+    def test_the_exercise_copy_check_refuses_a_link_in_the_copy(self):
+        from p4_health import frozen as FZ
+        fz, copy = self.freeze_with_exercise()
+        target = os.path.join(copy, "gen_runtime.py")
+        keep = os.path.join(os.path.dirname(copy), "same_bytes.py")
+        os.replace(target, keep)
+        os.symlink(keep, target)                # the very bytes the commit has, behind a link
+        with self.assertRaises(FZ.Refused):
+            fz.check_exercise(copy)
+
+    def test_the_exercise_copy_check_is_a_refusal_when_git_cannot_answer(self):
+        from p4_health import frozen as FZ
+        fz, copy = self.freeze_with_exercise()
+        fz.check_exercise(copy)                 # it passes while git answers
+        fz.git = lambda *a: (128, "")
+        with self.assertRaises(FZ.Refused):
+            fz.check_exercise(copy)
+        fz.git = None
+        with self.assertRaises(FZ.Refused):
+            fz.check_exercise(copy)
+
+
+    # --- round 7, finding 4: the exercise copy is checked again right before lab.load_model runs it ------------------
+    FAKE_CONVERT = (
+        "import json, os, sys\n"
+        "exercise = sys.argv[1]\n"
+        "out = sys.argv[sys.argv.index('--out') + 1]\n"
+        "edit = os.environ.get('FAKE_CONVERT_EDIT', '')\n"
+        "if edit == 'append':\n"
+        "    with open(os.path.join(exercise, 'gen_runtime.py'), 'a') as fh:\n"
+        "        fh.write('\\nEDITED_BY_CONVERT = True\\nimport builtins\\nbuiltins.EDITED_BY_CONVERT_RAN = True\\n')\n"
+        "elif edit == 'add':\n"
+        "    with open(os.path.join(exercise, 'extra_model.py'), 'w') as fh:\n"
+        "        fh.write('# written by convert\\n')\n"
+        "os.makedirs(out)\n"
+        "with open(os.path.join(out, 'package.json'), 'w') as fh:\n"
+        "    json.dump({}, fh)\n")
+
+    def run_lab_after_a_convert_that(self, edit):
+        """S0.convert over the checked exercise copy, with a fake convert.py that `edit`s ('append' to gen_runtime.py,
+        'add' a file, '' nothing) the directory it is given as input; then lab.run_lab with that S0's Frozen. The
+        model is loaded by the real lab.load_model; `expectations` and the rounds are markers, and the lab runner
+        is a RecordingRunner that must stay empty. Returns (rc, doc, models `expectations` was handed, the number
+        of rounds started, the lab runner's calls)."""
+        import tempfile
+        from unittest import mock
+        from p4_health import lab as LAB
+        from p4_health import s0 as S0M
+        from p4_health.collect.config import Config
+        from p4_health.collect.runner import RecordingRunner, Runner
+        import builtins
+        self.addCleanup(lambda: hasattr(builtins, "EDITED_BY_CONVERT_RAN") and delattr(builtins, "EDITED_BY_CONVERT_RAN"))
+        fz, copy = self.freeze_with_exercise()
+        run_dir = os.path.dirname(copy)
+        script = os.path.join(run_dir, "fake_convert.py")
+        with open(script, "w") as fh:
+            fh.write(self.FAKE_CONVERT)
+
+        class Redirect(Runner):
+            def run(self, argv, env=None, timeout=120, cwd=None, input_text=None):
+                return Runner.run(self, [sys.executable, script] + list(argv[2:]),
+                                  env=dict(env or {}, FAKE_CONVERT_EDIT=edit), timeout=timeout, cwd=cwd,
+                                  input_text=input_text)
+        x = S0M.S0(run_dir, Redirect(), sys.executable, frozen=fz, log=lambda *a: None)
+        self.assertEqual(x.ex, copy)
+        self.assertIsNotNone(x.convert("A", "topology.json", "ndtwin"))
+        models, rounds = [], []
+
+        def expectations(s0_out, rd, model):
+            models.append(model)
+            return {}, {}, {}
+        lab_runner = RecordingRunner()
+        with mock.patch.object(LAB, "expectations", expectations), \
+                mock.patch.object(LAB, "_rounds", lambda *a, **kw: rounds.append(1)):
+            rc, doc = LAB.run_lab(Config(run_dir, owner="o"), lab_runner, {"verdict": "COMPLETE"}, run_dir, "run-x",
+                                  expected_tsv=EXPECTED_TSV, log=lambda *a: None, signals=False, frozen=fz)
+        return rc, doc, models, len(rounds), lab_runner.calls, fz
+
+    def test_a_convert_that_appends_to_the_exercise_copys_gen_runtime_is_refused_before_load_model_runs_it(self):
+        """(Finding 4) The copy is checked once, right after S0 compiles; S0 then hands it to the shared tree's
+        convert.py as its input, and lab.load_model runs gen_runtime.py from it much later. A convert.py that
+        wrote into its input was run, not refused. load_model is before any claim, so the refusal is the run's
+        ordinary 'could not be set up': INCOMPLETE, rc 2, nothing started, and the record says which file."""
+        import builtins
+        rc, doc, models, rounds, calls, fz = self.run_lab_after_a_convert_that("append")
+        # the edited file must not even have been executed: a check made after load_model came too late
+        self.assertFalse(hasattr(builtins, "EDITED_BY_CONVERT_RAN"), "the edited gen_runtime.py was executed")
+        self.assertEqual(models, [], "the edited gen_runtime.py was loaded: %r" % [
+            getattr(m, "EDITED_BY_CONVERT", None) for m in models])
+        self.assertEqual((rounds, calls), (0, []))
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        text = " | ".join(doc["problems"])
+        self.assertIn("could not be set up", text)
+        self.assertIn("gen_runtime.py", text)
+        self.assertIn(fz.head, text)
+
+    def test_a_convert_that_adds_a_file_to_the_exercise_copy_is_refused_before_load_model_too(self):
+        rc, doc, models, rounds, calls, _fz = self.run_lab_after_a_convert_that("add")
+        self.assertEqual((models, rounds, calls), ([], 0, []))
+        self.assertEqual((doc["verdict"], rc), ("INCOMPLETE", 2))
+        self.assertIn("extra_model.py", " | ".join(doc["problems"]))
+
+    def test_a_convert_that_leaves_the_exercise_copy_alone_goes_on_to_the_rounds(self):
+        """The control of the two tests above."""
+        rc, doc, models, rounds, calls, _fz = self.run_lab_after_a_convert_that("")
+        self.assertEqual(doc["problems"], [])
+        self.assertEqual((len(models), rounds), (1, 1))
+        self.assertFalse(hasattr(models[0], "EDITED_BY_CONVERT"))
+
+
+    # --- round 6, the pin-HEAD NIT: HEAD is pinned first, and the clean check, the freeze and the identity use it --
+    def lab_pinned(self, hook=None):
+        """probe.py lab in a scratch repo whose S0 is a marker that keeps the Frozen it was given. `hook(args)`
+        runs after each git call (to land a commit at a chosen moment). Returns (rc, Frozen or None, stderr,
+        the repo's HEAD when the run began, the repo)."""
+        import io
+        import tempfile
+        from unittest import mock
+        from p4_health import probe
+        repo = self.scratch_repo()
+        start = self.git_in(repo, "rev-parse", "HEAD")
+        got = []
+
+        class Reached(BaseException):
+            pass
+
+        def s0(*a, **kw):
+            got.append(kw.get("frozen"))
+            raise Reached()
+        real = probe._git_run
+
+        def git(*args):
+            out = real(*args)
+            if hook:
+                hook(repo, args)
+            return out
+        run_dir = tempfile.mkdtemp(prefix="p4h-pin-run-%d-" % os.getpid())
+        self.addCleanup(__import__("shutil").rmtree, run_dir, True)
+        err = io.StringIO()
+        rc = None
+        with mock.patch.object(probe, "REPO", repo), mock.patch.object(probe, "_git_run", git), \
+                mock.patch("p4_health.s0.S0", s0), mock.patch("sys.stderr", err):
+            try:
+                rc = probe.main(["lab", "--run-dir", run_dir, "--owner", "o"])
+            except Reached:
+                pass
+        return rc, (got or [None])[0], err.getvalue(), start, repo
+
+    def commit_once(self, when, rel=("tools", "p4_health", "frames.py")):
+        """A hook that commits a change to `rel` the first time `when(args)` holds."""
+        done = []
+
+        def hook(repo, args):
+            if not done and when(args):
+                done.append(1)
+                with open(os.path.join(repo, *rel), "a") as fh:
+                    fh.write("# a commit that landed\n")
+                self.git_in(repo, "add", ".")
+                self.git_in(repo, "commit", "-q", "-m", "lands during the lab path")
+        return hook
+
+    def test_a_commit_that_lands_after_head_was_pinned_and_before_the_clean_check_is_refused(self):
+        """The freeze pinned HEAD only after the modules were loaded and the tree checked: a commit to
+        tools/p4_health in that one second made frozen_head name a commit the preloaded modules were not read
+        from. HEAD is pinned first; if it has moved when the clean check is done, the run is refused."""
+        # (round 7, finding 3) The commit is to lab.py: a module the run has loaded but does not freeze. frames.py,
+        # which this test used to commit, is one of the frozen files, so the freeze refused the change by itself
+        # and the re-check of HEAD was only seen in its message. Here, without the re-check, the run reaches S0 with
+        # frozen_head naming a commit its modules were not read from; the behavioural assertion is the first one.
+        hook = self.commit_once(lambda a: a[:3] == ("rev-parse", "--verify", "HEAD"),
+                                rel=("tools", "p4_health", "lab.py"))
+        rc, frozen, err, _start, _repo = self.lab_pinned(hook)
+        self.assertEqual((rc, frozen), (2, None), "the run went on to S0 on a HEAD that is not the one its modules "
+                                                  "were read from")
+        self.assertIn("refused:", err)
+        self.assertIn("HEAD moved", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_the_freeze_and_the_identity_use_the_sha_pinned_at_the_start(self):
+        """A commit that lands after the clean and HEAD checks (touching nothing the run copies) must not move
+        the pin: the Frozen names the commit HEAD was when the run began, not the one it is when the freeze runs."""
+        asked = []
+
+        def after_the_recheck(a):
+            if a[:3] == ("rev-parse", "--verify", "HEAD"):
+                asked.append(1)
+                return len(asked) == 2                      # the pin, then the re-check after the clean check
+            return False
+        hook = self.commit_once(after_the_recheck, rel=("unrelated.txt",))
+        rc, frozen, err, start, repo = self.lab_pinned(hook)
+        self.assertEqual(rc, None, err)                     # S0 was reached
+        self.assertEqual(frozen.head, start)
+        self.assertNotEqual(self.git_in(repo, "rev-parse", "HEAD"), start)      # and HEAD did move
+
+    def test_a_clean_run_pins_head_once_before_anything_else_is_asked(self):
+        """The control: with no commit landing, S0 is reached, the pin is the first git call, and the Frozen
+        carries it."""
+        calls = []
+        rc, frozen, err, start, _repo = self.lab_pinned(lambda repo, args: calls.append(args))
+        self.assertEqual(rc, None, err)
+        self.assertEqual(calls[0], ("rev-parse", "--verify", "HEAD"))
+        self.assertEqual(frozen.head, start)
+
+    def test_a_head_that_cannot_be_named_is_refused_before_the_clean_check(self):
+        from unittest import mock
+        from p4_health import probe
+        asked = []
+
+        def run(argv, **kw):
+            import subprocess as sp
+            asked.append(tuple(argv[3:]))
+            return sp.CompletedProcess(argv, 128 if argv[3:5] == ["rev-parse", "--verify"] else 0, stdout="", stderr="")
+        with mock.patch.object(probe.subprocess, "run", run), \
+                mock.patch("p4_health.frozen.freeze", side_effect=MustNotRun("the freeze must not start")), \
+                mock.patch("p4_health.s0.S0", side_effect=MustNotRun("S0 must not start")):
+            rc = probe.main(["lab", "--run-dir", "/nonexistent/run", "--owner", "o"])
+        self.assertEqual(rc, 2)
+        self.assertEqual([a for a in asked if a[0] == "status"], [])
 
 
 class TestCut2Decisions(unittest.TestCase):

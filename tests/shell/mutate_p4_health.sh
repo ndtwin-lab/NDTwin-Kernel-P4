@@ -51,6 +51,28 @@ GATE_TEST="$HERE/test_p4_health_gate_scripts.sh"
 GATEPY="$HERE/mutate_p4_health.sh"
 SUMPY="$HERE/sum_p4_health_gate_shards.sh"
 
+# (round 6, finding 7) A hash of the CONTENTS of the gate's own three scripts. `sha256sum a b c | sha256sum` hashes
+# sha256sum's output, which carries the scripts' paths: the same scripts at another path gave another hash, so two logs
+# could not be compared. Each file goes through stdin here, which has no name.
+gates_sum() {
+    local f
+    for f in "$GATEPY" "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64
+}
+
+# (round 6) Everything an uncommitted change to which would make the log lie about the commit it names: the subject,
+# its suites, the gate's own three scripts (mutation subjects now), and the files fresh_copy puts under test.
+WATCHED=(
+    tools/p4_health
+    tests/python/test_p4_health_cells.py
+    tests/python/test_p4_health_collect.py
+    tests/shell/test_p4_health_recover.sh
+    tests/shell/mutate_p4_health.sh
+    tests/shell/sum_p4_health_gate_shards.sh
+    tests/shell/test_p4_health_gate_scripts.sh
+    tools/p4_exercise
+    p4_proxy/mininet/grpc_ports.py
+)
+
 printf 'gate       : %s\n' "${BASH_SOURCE[0]}"
 printf 'cwd        : %s\n' "$PWD"
 printf 'interpreter: %s (%s)\n' "$(realpath "$PYTHON" 2>/dev/null || echo "MISSING: $PYTHON")" \
@@ -58,8 +80,9 @@ printf 'interpreter: %s (%s)\n' "$(realpath "$PYTHON" 2>/dev/null || echo "MISSI
 printf 'subject    : %s\n' "$PKG"
 printf 'HEAD       : %s (commit)\n' "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
 printf 'tree       : %s (git tree of tools/p4_health at HEAD)%s\n' "$(git -C "$REPO" rev-parse HEAD:tools/p4_health 2>/dev/null)" \
-    "$([[ -n "$(git -C "$REPO" status --porcelain -- tools/p4_health tests/python/test_p4_health_cells.py tests/python/test_p4_health_collect.py tests/shell/test_p4_health_recover.sh 2>/dev/null)" ]] && echo ' +UNCOMMITTED changes in the subject or its suites')"
+    "$([[ -n "$(git -C "$REPO" status --porcelain -- "${WATCHED[@]}" 2>/dev/null)" ]] && echo ' +UNCOMMITTED changes in the subject or its suites')"
 printf 'subject sha: %s\n' "$(cd "$PKG" && find . -name '*.py' -o -name '*.sh' | sort | xargs sha256sum | sha256sum | cut -c1-16)"
+printf 'gates sum  : %s\n' "$(gates_sum | cut -c1-16)"
 echo
 
 ANCHOR_CHECK="${ANCHOR_CHECK:-0}"
@@ -453,7 +476,7 @@ add "C5. health.json drops the controls" \
 # Review MAJ-4: every branch listed, decided on its own.
 add "B1. T1 never compares the dump" \
     "$TABLE" \
-    '        if set(got) != set(expect[dpid]):' \
+    '        if as_set(got) != as_set(expect[dpid]):' \
     '        if False:  # MUTANT' \
     'test_t1s_dump_half_decides_on_its_own'
 
@@ -1984,7 +2007,7 @@ add "C2R3-N1b. the stop signal is an Exception again (every except Exception swa
 
 add "C2R3-N1c. no handler between the rounds" \
     "$LABPY" \
-    '    old_handlers = _stop_on_signals() if signals else None' \
+    '    old_handlers = _stop_on_signals(noted) if signals else None' \
     '    old_handlers = None  # MUTANT' \
     'test_a_signal_between_the_rounds_ends_the_run'
 
@@ -2000,7 +2023,7 @@ add "C2R3-N3a. a git that could not answer reads as a clean tree" \
         # (Cut 2 review N3) no answer is not "clean"' \
     '    if False:  # MUTANT
         # (Cut 2 review N3) no answer is not "clean"' \
-    'test_a_git_that_cannot_answer_is_refused_before_s0'
+    'test_a_git_status_that_cannot_answer_is_refused_before_s0'
 
 add "C2R3-N3b. the lab starts without a system-under-test record" \
     "$PROBEPY" \
@@ -2187,7 +2210,7 @@ add "C2R4-F4b. two empty answers from git count as equal hashes" \
 
 add "C2R4-F4c. probe.py freezes without asking git" \
     "$PROBEPY" \
-    '        frozen = FZ.freeze(run_dir, repo=REPO, git=_git_run)' \
+    '        frozen = FZ.freeze(run_dir, repo=REPO, git=git_at_pinned_head)' \
     '        frozen = FZ.freeze(run_dir, repo=REPO, git=None)  # MUTANT' \
     'test_an_edit_between_the_clean_check_and_the_freeze_is_refused_before_s0'
 
@@ -2382,8 +2405,8 @@ add "C2R5-7a. the blobs are asked for by HEAD at that moment, not by the pinned 
 
 add "C2R5-7b. the Frozen does not carry the sha it was checked against" \
     "$FROZENPY" \
-    '    return Frozen(base, sums, head)' \
-    '    return Frozen(base, sums)  # MUTANT' \
+    '    return Frozen(base, sums, head, git)' \
+    '    return Frozen(base, sums, git=git)  # MUTANT' \
     'test_head_is_resolved_once_and_every_blob_is_asked_for_by_that_sha'
 
 add "C2R5-7c. probe.py writes the identity of HEAD as it is now, not of the frozen commit" \
@@ -2481,11 +2504,11 @@ add "C2R5-10a. the body's stop handler does not put the teardown's handler in be
 
 add "C2R5-10b. the record is finished after the run-level handlers are back" \
     "$LABROUND" \
-    '                self._finish(rec, t0)
-                self._restore_handlers()' \
-    '                self._restore_handlers()
-                self._finish(rec, t0)  # MUTANT' \
-    'test_a_stop_just_after_a_rounds_handlers_are_restored_keeps_that_rounds_record'
+    '                    self._finish(rec, t0)
+                    self._restore_handlers()' \
+    '                    self._restore_handlers()
+                    self._finish(rec, t0)  # MUTANT' \
+    'test_an_exception_after_a_rounds_record_is_final_keeps_that_rounds_record'
 
 add "C2R5-10c. a stop between a round and its record being appended loses the record" \
     "$LABPY" \
@@ -2541,8 +2564,8 @@ add "C2R5-11e. observations.json does not say whether the run was stopped" \
 
 add "C2R5-11f. observations.json does not carry the rounds' records" \
     "$LABPY" \
-    '                   "bringups": recs, "problems": problems}, fh,' \
-    '                   "bringups": [], "problems": problems}, fh,  # MUTANT' \
+    '                         "bringups": recs, "problems": problems}, default=_jsonable)' \
+    '                         "bringups": [], "problems": problems}, default=_jsonable)  # MUTANT' \
     'test_the_observations_a_run_writes_carry_what_the_offline_judge_reads'
 
 add "C2R5-12. the frozen set leaves out the adapter's common.py" \
@@ -2709,9 +2732,570 @@ add "C2R5-6y. the shard-sum script takes a refused run's log" \
 
 add "C2R5-6z. the shard-sum script prints another line when all is well" \
     "$SUMPY" \
-    'print("GATE: %d mutations, %d survived, shards %d/%d ok"' \
-    'print("GATE ok: %d mutations, %d survived, shards %d/%d"' \
+    'print("GATE: %d mutations, %d survived, shards %d/%d ok, commit %s, tree %s, subject sha %s"' \
+    'print("GATE ok: %d mutations, %d survived, shards %d/%d, commit %s, tree %s, subject sha %s"' \
     '[four good shards of ten: the one GATE line, rc 0]'
+
+
+# --- round 6 (C2R6-): the fifth round's open items ----------------------------------------------------------
+# finding 2: S0's copy of exercise/ is checked against the pinned commit, and the controller trial loads the copy
+add "C2R6-2a. S0 does not check its exercise copy against the pinned commit" \
+    "$S0PY" \
+    '        if self.frozen is not None and getattr(self.frozen, "head", None):
+            self.frozen.check_exercise(self.ex)' \
+    '        if False:  # MUTANT
+            self.frozen.check_exercise(self.ex)' \
+    'test_an_exercise_file_edited_after_the_clean_check_is_refused_before_any_lab_action'
+
+add "C2R6-2b. the exercise copy check is skipped when the compile failed" \
+    "$S0PY" \
+    '        built = self.compile_all()
+        self.check_exercise_copy()' \
+    '        built = self.compile_all()
+        if built:  # MUTANT
+            self.check_exercise_copy()' \
+    'test_an_exercise_file_edited_after_the_clean_check_is_refused_before_any_lab_action'
+
+add "C2R6-2c. the exercise copy check does not compare the bytes" \
+    "$FROZENPY" \
+    '        if h != committed[rel]:' \
+    '        if False:  # MUTANT' \
+    'test_the_exercise_copy_check_names_the_file_that_differs'
+
+add "C2R6-2d. a file the commit does not have is accepted in the exercise copy" \
+    "$FROZENPY" \
+    '    if extra or missing:' \
+    '    if missing:  # MUTANT' \
+    'test_the_exercise_copy_check_refuses_a_file_the_commit_does_not_have_and_one_it_lacks'
+
+add "C2R6-2e. a file the commit has may be missing from the exercise copy" \
+    "$FROZENPY" \
+    '    if extra or missing:' \
+    '    if extra:  # MUTANT' \
+    'test_the_exercise_copy_check_refuses_a_file_the_commit_does_not_have_and_one_it_lacks'
+
+add "C2R6-2f. a link in the exercise copy is followed" \
+    "$FROZENPY" \
+    '        if os.path.islink(found[rel]):' \
+    '        if False:  # MUTANT' \
+    'test_the_exercise_copy_check_refuses_a_link_in_the_copy'
+
+add "C2R6-2g. the exercise copy check passes without a commit or git to check against" \
+    "$FROZENPY" \
+    '    if git is None or not head:' \
+    '    if False:  # MUTANT' \
+    'test_the_exercise_copy_check_is_a_refusal_when_git_cannot_answer'
+
+add "C2R6-2h. the check does not leave out what the copy leaves out" \
+    "$FROZENPY" \
+    'COPY_IGNORE = ("__pycache__", "build*")' \
+    'COPY_IGNORE = ("__pycache__",)  # MUTANT' \
+    'test_the_exercise_copy_check_passes_for_the_tree_the_commit_has_and_ignores_build_output'
+
+add "C2R6-2i. probe.py lab lets a refused exercise copy out as a crash" \
+    "$PROBEPY" \
+    '    except FZ.Refused as exc:
+        # (round 6, finding 2)' \
+    '    except ZeroDivisionError as exc:  # MUTANT
+        # (round 6, finding 2)' \
+    'test_an_exercise_file_edited_after_the_clean_check_is_refused_before_any_lab_action'
+
+add "C2R6-2j. the controller trial ignores the exercise directory it is given" \
+    "$CTRLTRIAL" \
+    '"hc_gen", os.path.join(exercise or os.path.join(HERE, "exercise"), "gen_runtime.py"))' \
+    '"hc_gen", os.path.join(os.path.join(HERE, "exercise"), "gen_runtime.py"))  # MUTANT' \
+    'test_the_controller_trial_loads_the_model_from_the_runs_exercise_copy_not_the_shared_tree'
+
+add "C2R6-2k. S0 does not hand its exercise copy to the controller trial" \
+    "$S0PY" \
+    'default_p4dev_python(), utils, exercise=self.ex, **ctrl)' \
+    'default_p4dev_python(), utils, **ctrl)  # MUTANT' \
+    'test_the_controller_trial_loads_the_model_from_the_runs_exercise_copy_not_the_shared_tree'
+
+
+# finding 3: a stop that reaches the run level a second time, or outside run_lab's try, ends rc 2
+add "C2R6-3a. the run-level stop handler stays installed after the first stop" \
+    "$LABPY" \
+    '        _swap_handlers({s: noter for s in STOP_SIGNALS})
+        raise SignalAbort(signum)' \
+    '        raise SignalAbort(signum)  # MUTANT' \
+    'test_a_second_stop_while_run_lab_handles_the_first_gives_rc_2_not_pythons_status_1'
+
+add "C2R6-3b. the run level's noter drops a stop" \
+    "$LABPY" \
+    '        noted.append(signum)' \
+    '        pass  # MUTANT' \
+    'test_a_second_stop_while_run_lab_handles_the_first_gives_rc_2_not_pythons_status_1'
+
+add "C2R6-3c. the run level's first stop does not note-only afterwards (the noter raises too)" \
+    "$LABPY" \
+    '    def noter(signum, _frame):
+        noted.append(signum)' \
+    '    def noter(signum, _frame):
+        noted.append(signum)
+        raise SignalAbort(signum)  # MUTANT' \
+    'test_the_run_levels_first_stop_puts_a_noter_in_before_it_raises'
+
+add "C2R6-3d. probe.py lab lets a stop out of main() as an uncaught exception" \
+    "$PROBEPY" \
+    '        except SignalAbort as exc:
+            # (round 6, finding 3)' \
+    '        except ZeroDivisionError as exc:  # MUTANT
+            # (round 6, finding 3)' \
+    'test_a_stop_that_gets_out_of_the_lab_path_is_rc_2_stopped_not_pythons_status_1'
+
+add "C2R6-3e. probe.py lab answers a stop that got out with status 1" \
+    "$PROBEPY" \
+    '                  % (exc.signum, set_verdict_aside(args.run_dir)), file=sys.stderr)
+            return 2' \
+    '                  % (exc.signum, set_verdict_aside(args.run_dir)), file=sys.stderr)
+            return 1  # MUTANT' \
+    'test_a_stop_that_gets_out_of_the_lab_path_is_rc_2_stopped_not_pythons_status_1'
+
+
+# finding 4: _finish and the handler restore under one signal mask; a record cut off before _finish is not complete
+add "C2R6-4a. _finish and the handler restore are not under one signal mask" \
+    "$LABROUND" \
+    '                with self._masked():
+                    self._finish(rec, t0)' \
+    '                if True:  # MUTANT
+                    self._finish(rec, t0)' \
+    'test_a_stop_from_a_hook_inside_finish_after_it_read_the_teardown_signal_means_b_is_not_claimed'
+
+add "C2R6-4b. the mask lets the stop signals through" \
+    "$LABROUND" \
+    '        held = signal.pthread_sigmask(signal.SIG_BLOCK, self.SIGS)' \
+    '        held = signal.pthread_sigmask(signal.SIG_BLOCK, ())  # MUTANT' \
+    'test_a_stop_from_a_hook_inside_finish_after_it_read_the_teardown_signal_means_b_is_not_claimed'
+
+add "C2R6-4c. the mask is never lifted" \
+    "$LABROUND" \
+    '            signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    '            pass  # MUTANT' \
+    'test_a_stop_from_a_hook_inside_finish_after_it_read_the_teardown_signal_means_b_is_not_claimed'
+
+add "C2R6-4d. a round cut off before its record was finished keeps the complete the body set" \
+    "$LABPY" \
+    '                rec["complete"] = False
+                rec["problems"].append("the round was cut off' \
+    '                rec["problems"].append("the round was cut off' \
+    'test_a_round_cut_off_before_its_record_was_finished_is_not_complete_in_health_json'
+
+add "C2R6-4e. a round cut off before its record was finished says nothing about it" \
+    "$LABPY" \
+    '            if rec.get("seconds") is None:' \
+    '            if False:  # MUTANT' \
+    'test_a_round_cut_off_before_its_record_was_finished_is_not_complete_in_health_json'
+
+
+# finding 5: observations.json first, health.json last, through tmp + replace; the catch-all sets a verdict aside
+add "C2R6-5a. health.json is written before observations.json" \
+    "$LABPY" \
+    '    R.write_json_atomic(os.path.join(run_dir, "observations.json"),' \
+    '    R.dump(os.path.join(run_dir, "health.json"), doc)  # MUTANT
+    R.write_json_atomic(os.path.join(run_dir, "observations.json"),' \
+    'test_an_error_writing_observations_json_leaves_no_health_json_and_exits_2'
+
+add "C2R6-5b. the temp file is not put in place with os.replace" \
+    "$REPORTPY" \
+    '        os.replace(tmp, path)' \
+    '        os.rename(tmp, path)  # MUTANT' \
+    'test_an_error_putting_observations_json_in_place_leaves_no_health_json_and_exits_2'
+
+add "C2R6-5c. report.dump writes in place" \
+    "$REPORTPY" \
+    '    tmp = "%s.tmp-%d" % (path, os.getpid())' \
+    '    tmp = path  # MUTANT' \
+    'test_a_write_that_fails_half_way_leaves_the_earlier_file_whole'
+
+add "C2R6-5d. a failed write leaves its temp file behind" \
+    "$REPORTPY" \
+    '        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise' \
+    '        raise  # MUTANT' \
+    'test_a_write_that_fails_half_way_leaves_the_earlier_file_whole'
+
+add "C2R6-5e. the catch-all leaves an existing health.json as it is" \
+    "$PROBEPY" \
+    '    try:
+        os.replace(path, aside)' \
+    '    try:
+        return ""  # MUTANT
+        os.replace(path, aside)' \
+    'test_an_error_after_health_json_was_written_sets_it_aside_as_not_a_verdict'
+
+add "C2R6-5f. the catch-all message starts with refused:" \
+    "$PROBEPY" \
+    '            print("ERROR: the lab run ended on an exception' \
+    '            print("refused: the lab run ended on an exception' \
+    'test_the_catch_all_does_not_look_like_a_deliberate_refusal'
+
+
+# finding 10: the offline verdict command reads back what run_lab wrote
+add "C2R6-10a. T1 compares the thrift dump as a set of lists" \
+    "$TABLE" \
+    '        if as_set(got) != as_set(expect[dpid]):' \
+    '        if set(got) != set(expect[dpid]):  # MUTANT' \
+    'test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells'
+
+add "C2R6-10b. M1 compares the group's ports with a frozenset directly" \
+    "$TABLE" \
+    '    if as_set(o["s1_group1"]) != frozenset({1, 2}):' \
+    '    if o["s1_group1"] != frozenset({1, 2}):  # MUTANT' \
+    'test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells'
+
+add "C2R6-10c. M2 compares the group's ports with a frozenset directly" \
+    "$TABLE" \
+    '    if as_set(o["group2_after"]) != as_set(o["declared"]):' \
+    '    if o["group2_after"] != frozenset(o["declared"]):  # MUTANT' \
+    'test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells'
+
+add "C2R6-10d. C1 compares the mirror's ports with a frozenset directly" \
+    "$TABLE" \
+    '    if as_set(o["ports"]) != frozenset({1}):' \
+    '    if o["ports"] != frozenset({1}):  # MUTANT' \
+    'test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells'
+
+add "C2R6-10e. as_set does not turn a nested list into a tuple" \
+    "$TABLE" \
+    '        return tuple(hashable(i) for i in x) if isinstance(x, (list, tuple)) else x' \
+    '        return x  # MUTANT' \
+    'test_a_complete_runs_observations_judge_offline_to_the_same_headline_and_cells'
+
+
+# the pin-HEAD NIT: HEAD is pinned first; the clean check, the freeze and the identity use that sha
+add "C2R6-pin-a. probe.py lab goes on when HEAD cannot be named" \
+    "$PROBEPY" \
+    '    if h_rc != 0 or not pinned:' \
+    '    if False:  # MUTANT' \
+    'test_a_head_that_cannot_be_named_is_refused_before_the_clean_check'
+
+add "C2R6-pin-b. probe.py lab does not look at HEAD again after the clean check" \
+    "$PROBEPY" \
+    '    if h_rc != 0 or now != pinned:' \
+    '    if False:  # MUTANT' \
+    'test_a_commit_that_lands_after_head_was_pinned_and_before_the_clean_check_is_refused'
+
+add "C2R6-pin-c. the freeze resolves HEAD again instead of taking the pinned sha" \
+    "$PROBEPY" \
+    '        frozen = FZ.freeze(run_dir, repo=REPO, git=git_at_pinned_head)' \
+    '        frozen = FZ.freeze(run_dir, repo=REPO, git=_git_run)  # MUTANT' \
+    'test_the_freeze_and_the_identity_use_the_sha_pinned_at_the_start'
+
+add "C2R6-pin-d. the pin is not the first thing asked of git" \
+    "$PROBEPY" \
+    '    h_rc, pinned = _git_run("rev-parse", "--verify", "HEAD")' \
+    '    _git_run("status", "--porcelain", "--", "tools/p4_health")  # MUTANT
+    h_rc, pinned = _git_run("rev-parse", "--verify", "HEAD")' \
+    'test_a_clean_run_pins_head_once_before_anything_else_is_asked'
+
+
+# finding 6: the GATE line names what it certifies and refuses logs of another commit or tree; the gate marks
+# an uncommitted change to its own scripts and to what it copies
+add "C2R6-6a. the shard-sum script accepts logs of a commit that is not the checkout's HEAD" \
+    "$SUMPY" \
+    '        if commit != want:' \
+    '        if False:  # MUTANT' \
+    '[logs that agree with each other, of a commit that is not the checkout'"'"'s HEAD]'
+
+add "C2R6-6b. the shard-sum script accepts a tools/p4_health tree that is not the commit's" \
+    "$SUMPY" \
+    '        elif tree != want_tree:' \
+    '        elif False:  # MUTANT' \
+    "[logs of the checkout's HEAD that name another tools/p4_health tree]"
+
+add "C2R6-6c. the shard-sum script ignores --commit" \
+    "$SUMPY" \
+    '    if commit_arg is not None:' \
+    '    if False:  # MUTANT' \
+    "[--commit naming the logs' commit is accepted, and the GATE line names that commit]"
+
+add "C2R6-6d. the shard-sum script goes on when git cannot name HEAD" \
+    "$SUMPY" \
+    '    if h_rc != 0 or not head:' \
+    '    if False:  # MUTANT' \
+    '[a checkout git cannot read refuses the logs]'
+
+add "C2R6-6e. the GATE line does not carry the subject sha" \
+    "$SUMPY" \
+    'facts[0]["commit"], facts[0]["tree"], facts[0]["subj"]))' \
+    'facts[0]["commit"], facts[0]["tree"], "-"))  # MUTANT' \
+    '[four good shards of ten: the one GATE line, rc 0]'
+
+add "C2R6-6f. the GATE line does not carry the tree" \
+    "$SUMPY" \
+    'facts[0]["commit"], facts[0]["tree"], facts[0]["subj"]))' \
+    'facts[0]["commit"], facts[0]["commit"], facts[0]["subj"]))  # MUTANT' \
+    '[four good shards of ten: the one GATE line, rc 0]'
+
+add "C2R6-6g. the shard-sum script takes an option it does not know for a log" \
+    "$SUMPY" \
+    '    elif a.startswith("--"):
+        problems.append("unknown option %s" % a)' \
+    '    elif a.startswith("--"):
+        logs.append(a)  # MUTANT' \
+    '[an unknown option is refused]'
+
+add "C2R6-6h. --commit needs no value" \
+    "$SUMPY" \
+    '        if not args:
+            problems.append("--commit needs a commit")' \
+    '        if False:  # MUTANT
+            problems.append("--commit needs a commit")' \
+    '[--commit with nothing after it is refused]'
+
+add "C2R6-6i. the gate does not mark an uncommitted edit to its own mutation script" \
+    "$GATEPY" \
+    '    tests/shell/test_p4_health_rec''over.sh
+    tests/shell/mutate_p4_health.sh
+' \
+    '    tests/shell/test_p4_health_recover.sh
+' \
+    "[an uncommitted edit to the gate's own script tests/shell/mutate_p4_health.sh is marked]"
+
+add "C2R6-6j. the gate does not mark an uncommitted edit to the shard-sum script" \
+    "$GATEPY" \
+    '    tests/shell/mutate_p4_h''ealth.sh
+    tests/shell/sum_p4_health_gate_shards.sh
+' \
+    '    tests/shell/mutate_p4_health.sh
+' \
+    "[an uncommitted edit to the gate's own script tests/shell/sum_p4_health_gate_shards.sh is marked]"
+
+add "C2R6-6k. the gate does not mark an uncommitted edit to the gate-script tests" \
+    "$GATEPY" \
+    '    tests/shell/sum_p4_health_gate_sh''ards.sh
+    tests/shell/test_p4_health_gate_scripts.sh
+' \
+    '    tests/shell/sum_p4_health_gate_shards.sh
+' \
+    "[an uncommitted edit to the gate's own script tests/shell/test_p4_health_gate_scripts.sh is marked]"
+
+add "C2R6-6l. the gate does not mark an uncommitted edit to tools/p4_exercise" \
+    "$GATEPY" \
+    '    tests/shell/test_p4_health_gate_scr''ipts.sh
+    tools/p4_exercise
+' \
+    '    tests/shell/test_p4_health_gate_scripts.sh
+' \
+    '[an uncommitted edit to tools/p4_exercise/common.py is marked]'
+
+add "C2R6-6m. the gate does not mark an uncommitted edit to grpc_ports.py" \
+    "$GATEPY" \
+    '    tools/p4_exe''rcise
+    p4_proxy/mininet/grpc_ports.py
+' \
+    '    tools/p4_exercise
+' \
+    '[an uncommitted edit to p4_proxy/mininet/grpc_ports.py is marked]'
+
+
+# finding 7: the hash of the gate's own scripts depends on their contents only
+add "C2R6-7a. the hash of the gate's scripts is of sha256sum's output, which carries their paths" \
+    "$GATEPY" \
+    '    for f in "$GATEPY"'' "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64' \
+    '    for f in "$GATEPY" "$SUMPY" "$GATE_TEST"; do sha256sum "$f"; done | sha256sum | cut -c1-64  # MUTANT' \
+    '[the same scripts in another directory give the same hash]'
+
+add "C2R6-7b. the hash of the gate's scripts leaves out the gate-script tests" \
+    "$GATEPY" \
+    '    for f in "$GATEPY"'' "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done' \
+    '    for f in "$GATEPY" "$SUMPY"; do sha256sum < "$f"; done  # MUTANT' \
+    '[an edit to test_p4_health_gate_scripts.sh changes the hash]'
+
+add "C2R6-7c. the hash of the gate's scripts leaves out the shard-sum script" \
+    "$GATEPY" \
+    '    for f in "$GATEPY"'' "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64' \
+    '    for f in "$GATEPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64  # MUTANT' \
+    '[an edit to sum_p4_health_gate_shards.sh changes the hash]'
+
+add "C2R6-7d. the hash of the gate's scripts leaves out the gate script itself" \
+    "$GATEPY" \
+    '    for f in "$GATEPY"'' "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64' \
+    '    for f in "$SUMPY" "$GATE_TEST"; do sha256sum < "$f"; done | sha256sum | cut -c1-64  # MUTANT' \
+    '[an edit to mutate_p4_health.sh changes the hash]'
+
+
+# --- round 7 (C2R7-): the sixth round's review ---------------------------------------------------------------
+# finding 1: no thread of the process may be able to take a stop while a round's mask is up (lab.run_lab refuses),
+# and the ValueSet trial, which starts gRPC threads in this process, runs with the three signals blocked
+add "C2R7-1a. run_lab does not look at the process's threads" \
+    "$LABPY" \
+    '    if prepared is not None and signals:
+        # (round 7, finding 1)' \
+    '    if False:  # MUTANT
+        # (round 7, finding 1)' \
+    'test_a_running_thread_that_does_not_block_sigterm_means_the_lab_is_refused_before_any_claim'
+
+add "C2R7-1b. the thread check leaves SIGHUP out" \
+    "$LABPY" \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS}' \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS if s != signal.SIGHUP}  # MUTANT' \
+    'test_a_running_thread_that_does_not_block_sighup_is_refused_too'
+
+add "C2R7-1c. the thread check leaves SIGINT out" \
+    "$LABPY" \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS}' \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS if s != signal.SIGINT}  # MUTANT' \
+    'test_a_running_thread_that_does_not_block_sigint_is_refused_too'
+
+add "C2R7-1d. the thread check leaves SIGTERM out" \
+    "$LABPY" \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS}' \
+    '_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS if s != signal.SIGTERM}  # MUTANT' \
+    'test_a_running_thread_that_does_not_block_sigterm_means_the_lab_is_refused_before_any_claim'
+
+add "C2R7-1e. the calling thread is judged like the others" \
+    "$LABPY" \
+    '        if tid == me:' \
+    '        if False:  # MUTANT' \
+    'test_the_calling_thread_is_not_judged_and_threads_that_block_all_three_signals_pass'
+
+add "C2R7-1f. a /proc that cannot be listed passes" \
+    "$LABPY" \
+    '    except OSError as exc:
+        return ("refused: cannot tell whether' \
+    '    except OSError as exc:
+        return ""  # MUTANT
+        return ("refused: cannot tell whether' \
+    'test_a_proc_that_cannot_be_read_is_a_refusal_not_a_pass'
+
+add "C2R7-1g. a thread whose mask cannot be read passes" \
+    "$LABPY" \
+    '            unreadable.append("thread %s (%s: %s)" % (tid, type(exc).__name__, exc))' \
+    '            pass  # MUTANT' \
+    'test_a_thread_whose_status_cannot_be_read_or_has_no_sigblk_line_is_a_refusal'
+
+add "C2R7-1h. only the first thread that can take a stop is named" \
+    "$LABPY" \
+    '        if missing:
+            bad.append(' \
+    '        if missing and not bad:  # MUTANT
+            bad.append(' \
+    'test_every_thread_that_does_not_block_them_is_named'
+
+add "C2R7-1i. a thread that blocks only part of the three passes when it blocks any of them" \
+    "$LABPY" \
+    '        missing = [s.name for s, bit in _STOP_BITS.items() if not blk & bit]' \
+    '        missing = [] if blk & sum(_STOP_BITS.values()) else [s.name for s, bit in _STOP_BITS.items()]  # MUTANT' \
+    'test_a_thread_with_only_two_of_the_three_bits_set_is_named_in_the_refusal'
+
+add "C2R7-1j. the refusal is written down and the run goes on" \
+    "$LABPY" \
+    '            log("  " + refusal)
+            prepared = None' \
+    '            log("  " + refusal)  # MUTANT' \
+    'test_a_running_thread_that_does_not_block_sigterm_means_the_lab_is_refused_before_any_claim'
+
+add "C2R7-1k. the ValueSet trial runs without the stops blocked" \
+    "$S0PY" \
+    '            with stops_held():
+                results = [VT.trial(' \
+    '            if True:  # MUTANT
+                results = [VT.trial(' \
+    'test_the_valueset_trial_is_entered_with_the_three_stop_signals_blocked_and_the_mask_is_put_back'
+
+add "C2R7-1l. the trial block does not block" \
+    "$S0PY" \
+    '    held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)' \
+    '    held = signal.pthread_sigmask(signal.SIG_BLOCK, ())  # MUTANT' \
+    'test_the_valueset_trial_is_entered_with_the_three_stop_signals_blocked_and_the_mask_is_put_back'
+
+add "C2R7-1m. the trial block leaves SIGHUP out" \
+    "$S0PY" \
+    'STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)' \
+    'STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)  # MUTANT' \
+    'test_the_valueset_trial_is_entered_with_the_three_stop_signals_blocked_and_the_mask_is_put_back'
+
+add "C2R7-1n. the trial block is never lifted" \
+    "$S0PY" \
+    '        signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    '        pass  # MUTANT' \
+    'test_the_valueset_trial_is_entered_with_the_three_stop_signals_blocked_and_the_mask_is_put_back'
+
+add "C2R7-1o. the trial block is lifted only when the trial does not raise" \
+    "$S0PY" \
+    '    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    '    yield  # MUTANT
+    signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    'test_the_mask_is_put_back_when_the_trial_raises_and_the_failure_is_still_recorded'
+
+add "C2R7-1p. a throwaway switch keeps the blocked stops" \
+    "$THROWAWAY" \
+    '    signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGTERM, signal.SIGINT, signal.SIGHUP))' \
+    '    pass  # MUTANT' \
+    'test_a_throwaway_switch_does_not_inherit_the_blocked_stops'
+
+add "C2R7-1q. a throwaway switch is given back only SIGHUP and SIGINT" \
+    "$THROWAWAY" \
+    '    signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGTERM, signal.SIGINT, signal.SIGHUP))' \
+    '    signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGHUP))  # MUTANT' \
+    'test_a_throwaway_switch_does_not_inherit_the_blocked_stops'
+
+add "C2R7-1r. a stop during the trial is dropped, not held" \
+    "$S0PY" \
+    '    held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    '    held = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        yield
+    finally:
+        for sig in STOP_SIGNALS:  # MUTANT
+            signal.sigtimedwait([sig], 0)
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)' \
+    'test_a_stop_that_arrives_during_the_trial_waits_and_is_delivered_when_the_mask_is_put_back'
+
+
+# finding 4: the exercise copy is checked again right before lab.load_model runs it
+add "C2R7-3a. run_lab does not check the exercise copy again before loading the model" \
+    "$LABPY" \
+    '            if getattr(frozen, "head", None):
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    '            if False:  # MUTANT
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    'test_a_convert_that_appends_to_the_exercise_copys_gen_runtime_is_refused_before_load_model_runs_it'
+
+add "C2R7-3b. the exercise copy is checked after the model was loaded from it" \
+    "$LABPY" \
+    '            if getattr(frozen, "head", None):
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))
+            model = load_model(os.path.join(run_dir, "exercise"))' \
+    '            model = load_model(os.path.join(run_dir, "exercise"))  # MUTANT
+            if getattr(frozen, "head", None):
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    'test_a_convert_that_appends_to_the_exercise_copys_gen_runtime_is_refused_before_load_model_runs_it'
+
+add "C2R7-3c. the re-check is made without a pinned commit to check against" \
+    "$LABPY" \
+    '            if getattr(frozen, "head", None):
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    '            if True:  # MUTANT
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    'test_a_then_b_then_the_verdicts'
+
+add "C2R7-3d. the re-check looks at the run directory, not the exercise copy" \
+    "$LABPY" \
+    '                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    '                frozen.check_exercise(run_dir)  # MUTANT' \
+    'test_a_convert_that_leaves_the_exercise_copy_alone_goes_on_to_the_rounds'
+
+add "C2R7-3e. a refused exercise copy is let through" \
+    "$LABPY" \
+    '                frozen.check_exercise(os.path.join(run_dir, "exercise"))' \
+    '                try:
+                    frozen.check_exercise(os.path.join(run_dir, "exercise"))
+                except FZ.Refused:  # MUTANT
+                    pass' \
+    'test_a_convert_that_adds_a_file_to_the_exercise_copy_is_refused_before_load_model_too'
 
 
 CTRL_SRC="$TABLE"
@@ -2769,7 +3353,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4-health-mutate-XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 SURVIVORS=0; MUTATIONS=0
 BASE_SUM="$(cd "$PKG" && find . -type f \( -name '*.py' -o -name '*.sh' -o -name '*.p4' \) | sort | xargs sha256sum | sha256sum)"
-GATES_SUM="$(sha256sum "$GATEPY" "$SUMPY" "$GATE_TEST" | sha256sum)"
+GATES_SUM="$(gates_sum)"
 
 fresh_copy() {
     rm -rf "$WORK/tools"; mkdir -p "$WORK/tools"
@@ -2891,14 +3475,16 @@ printf '\n--- was the original written? ---\n'
 NOW_SUM="$(cd "$PKG" && find . -type f \( -name '*.py' -o -name '*.sh' -o -name '*.p4' \) | sort | xargs sha256sum | sha256sum)"
 if [[ "$NOW_SUM" != "$BASE_SUM" ]]; then echo "  🔴 tools/p4_health CHANGED DURING THE GATE"; exit 2; fi
 echo "  byte-identical  tools/p4_health  ${BASE_SUM:0:16}"
-if [[ "$(sha256sum "$GATEPY" "$SUMPY" "$GATE_TEST" | sha256sum)" != "$GATES_SUM" ]]; then
+if [[ "$(gates_sum)" != "$GATES_SUM" ]]; then
     echo "  🔴 THE GATE'S OWN SCRIPTS CHANGED DURING THE GATE"; exit 2; fi
 echo "  byte-identical  the gate's own scripts  ${GATES_SUM:0:16}"
 after_red=$(red_tests)
 [[ -n "$after_red" ]] && { echo "🔴 a suite is red against the real files: $after_red"; exit 2; }
 echo "  suites green against the real files"
 
-(( MUTATIONS == SELECTED )) || { echo "REFUSED: $MUTATIONS mutations ran, $SELECTED were selected"; exit 2; }
+# (round 6, finding 7) There was a `(( MUTATIONS == SELECTED ))` guard here that could not fail: MUTATIONS is
+# incremented at the top of every mutate(), and the loop calls mutate() once per selected index. What really
+# checks that a shard ran its share is the shard-sum script (the "add up" check, against positions k, k+n, ...).
 printf '\n%s mutations, %s survived\n' "$MUTATIONS" "$SURVIVORS"
 [[ -n "$SHARD_N" ]] && printf 'SHARD %s/%s of %s mutations in the table\nNOT THE GATE BY ITSELF: shard %s/%s\n' \
     "$SHARD_K" "$SHARD_N" "${#MUT_LABEL[@]}" "$SHARD_K" "$SHARD_N"

@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import signal
+import threading
 
 from . import attribution as AT
 from . import expected as E
@@ -105,6 +106,12 @@ def take_unrecorded(cfg, holder, recs):
     for lr in holder.get("rounds") or []:
         rec = getattr(lr, "rec", None)
         if rec is not None and not any(rec is r for r in recs):
+            if rec.get("seconds") is None:
+                # (round 6, finding 4) `_finish` sets "seconds": it never ran, so the teardown may not have
+                # either, and `complete` may still be the True the end of the body set
+                rec["complete"] = False
+                rec["problems"].append("the round was cut off before its record was finished (its teardown may "
+                                       "not have run): finish with recover.sh on the run dir")
             recs.append(rec)
             keep_state(cfg, lr.bringup)
 
@@ -114,13 +121,83 @@ def signalled(rec):
     return any(str(p).startswith("aborted by signal") for p in (rec or {}).get("problems") or [])
 
 
-def _stop_on_signals():
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+#: Where this process lists its threads. Tests point it at a stand-in tree.
+PROC_TASK = "/proc/self/task"
+_STOP_BITS = {s: 1 << (int(s) - 1) for s in STOP_SIGNALS}
+
+
+def stop_signal_threads_refusal():
+    """(Cut 2 round 7, finding 1) "" when every thread of this process other than the calling one blocks SIGTERM, SIGINT
+    and SIGHUP, else the sentence that says why the lab must not be touched.
+
+    The round's mask (lab_round.LabRound._masked) blocks the three in the calling thread only. A stop sent to the
+    process meanwhile goes to a thread that does not block it, and Python then runs the handler in the main thread,
+    inside the masked region, where it is still the teardown's noter: nothing reads it again and the next bring-up is
+    claimed over it. So no other thread may be able to take one. Each thread's mask is read from
+    <PROC_TASK>/<tid>/status (SigBlk). A thread that cannot be read, or a /proc that cannot, is a refusal: this
+    cannot be shown, so it is not assumed."""
+    try:
+        tids = sorted(os.listdir(PROC_TASK), key=lambda t: (len(t), t))
+    except OSError as exc:
+        return ("refused: cannot tell whether a thread of this process can take a stop signal (%s: %s); the lab is "
+                "not touched" % (PROC_TASK, exc))
+    me = str(threading.get_native_id())
+    bad, unreadable = [], []
+    for tid in tids:
+        if tid == me:
+            continue
+        path = os.path.join(PROC_TASK, tid, "status")
+        try:
+            with open(path, encoding="ascii", errors="replace") as fh:
+                lines = fh.read().splitlines()
+            blk = int([l for l in lines if l.startswith("SigBlk:")][0].split()[1], 16)
+        except (OSError, IndexError, ValueError) as exc:
+            if not os.path.isdir(os.path.join(PROC_TASK, tid)):
+                continue                            # the thread ended while the list was being read
+            unreadable.append("thread %s (%s: %s)" % (tid, type(exc).__name__, exc))
+            continue
+        missing = [s.name for s, bit in _STOP_BITS.items() if not blk & bit]
+        if missing:
+            bad.append("thread %s does not block %s" % (tid, ", ".join(missing)))
+    if not (bad or unreadable):
+        return ""
+    why = "; ".join(bad + ["cannot read the signal mask of " + u for u in unreadable])
+    return ("refused: %s. A stop signal could be delivered to such a thread while a round's mask is up and be lost, "
+            "with the next bring-up claimed over it; the lab is not touched" % why)
+
+
+def _swap_handlers(handlers):
+    """Install `handlers` ({signal: handler}) with the three stop signals blocked meanwhile (as
+    LabRound._swap_handlers does), so no stop arrives between two of the switches; one that came in while they
+    were blocked is delivered when the mask is put back, to the handler then in place. Returns the handlers
+    replaced."""
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        return {s: signal.signal(s, h) for s, h in handlers.items()}
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+
+def _stop_on_signals(noted=None):
     """(Cut 2 review N1) For the whole run, not only inside a round: a stop signal between A's
     teardown and B's claim raises SignalAbort here too, instead of killing the probe with its
-    default action. Returns the handlers it replaced."""
+    default action. Returns the handlers it replaced.
+
+    (round 6, finding 3) One-shot, like the round's: the first stop puts a noter in BEFORE it raises, so a
+    second one -- while run_lab's `except SignalAbort` body is copying files, say -- is only noted (appended
+    to `noted`) and cannot raise over the first, out of run_lab and out of main()."""
+    noted = noted if noted is not None else []
+
+    def noter(signum, _frame):
+        noted.append(signum)
+
     def raiser(signum, _frame):
+        _swap_handlers({s: noter for s in STOP_SIGNALS})
         raise SignalAbort(signum)
-    return {s: signal.signal(s, raiser) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    return _swap_handlers({s: raiser for s in STOP_SIGNALS})
 
 
 def _rounds(cfg, runner, run_id, model, pipelines, runtimes, orders, only, mutant, bringups,
@@ -179,7 +256,7 @@ def run_lab(cfg, runner, s0_out, run_dir, run_id, bringups=("A", "B"), only=None
 
     `frozen`: the code copies `probe.py lab` froze before S0 and checked against HEAD
     (frozen.freeze). Without it -- the offline tests -- the files are copied here, unchecked."""
-    recs, problems, holder, run_stopped = [], [], {}, []
+    recs, problems, holder, run_stopped, noted = [], [], {}, [], []
     frozen = frozen or FZ.freeze(run_dir)
     ended_early = False                 # an exception ended the rounds (a signal is `run_stopped`)
     prepared = None
@@ -190,19 +267,33 @@ def run_lab(cfg, runner, s0_out, run_dir, run_id, bringups=("A", "B"), only=None
         log(problems[-1])
     else:
         try:
+            # (round 7, finding 4) S0 checked its copy of exercise/ once, right after compile_all, and then handed
+            # it to the shared tree's convert.py as its input: a convert.py that wrote into it would have its
+            # gen_runtime.py run here. Checked again, against the same pinned commit, immediately before it is
+            # loaded. This is before any claim: a refusal is this run's ordinary "could not be set up".
+            if getattr(frozen, "head", None):
+                frozen.check_exercise(os.path.join(run_dir, "exercise"))
             model = load_model(os.path.join(run_dir, "exercise"))
             pipelines, runtimes, orders = expectations(s0_out, run_dir, model)
             prepared = (model, pipelines, runtimes, orders)
         except Exception as exc:  # noqa: BLE001 -- a run that cannot be set up is INCOMPLETE, with the reason
             problems.append("the run could not be set up: %s: %s" % (type(exc).__name__, exc))
             log("  " + problems[-1])
+    if prepared is not None and signals:
+        # (round 7, finding 1) before the first lab action: a thread that can take a stop makes the round's mask
+        # worth nothing, so the lab is not touched
+        refusal = stop_signal_threads_refusal()
+        if refusal:
+            problems.append(refusal)
+            log("  " + refusal)
+            prepared = None
     if prepared is not None:
         model, pipelines, runtimes, orders = prepared
         packages = os.path.join(run_dir, "packages")
         a_kwargs = dict({"hostside": frozen.hostside}, **(a_kwargs or {}))
         b_kwargs = dict({"hostside": frozen.hostside, "controller": frozen.controller,
                          "adapter": frozen.adapter}, **(b_kwargs or {}))
-        old_handlers = _stop_on_signals() if signals else None
+        old_handlers = _stop_on_signals(noted) if signals else None
         try:
             _rounds(cfg, runner, run_id, model, pipelines, runtimes, orders, only, mutant, bringups,
                     packages, round_cls, a_kwargs, b_kwargs, tutorials_utils, run_dir, recs, problems,
@@ -224,6 +315,10 @@ def run_lab(cfg, runner, s0_out, run_dir, run_id, bringups=("A", "B"), only=None
             if old_handlers is not None:
                 for sig, h in old_handlers.items():
                     signal.signal(sig, h)
+        if noted:
+            problems.append("%d further stop signal(s) (%s) came while the first was being handled: noted, not "
+                            "acted on" % (len(noted), ", ".join(str(n) for n in noted)))
+            log("  " + problems[-1])
     a, b = holder.get("A"), holder.get("B")
     observations = merge(a.observations if a else {}, b.confirmed if b else None)
     if s0_out.get("verdict") == "COMPLETE":
@@ -254,13 +349,16 @@ def run_lab(cfg, runner, s0_out, run_dir, run_id, bringups=("A", "B"), only=None
     # (Cut 2 review m4) design 4.3's system_under_test and the Q6(a) gate fingerprint
     doc["system_under_test"] = (identity or {}).get("system_under_test")
     doc["gate_fingerprint"] = (identity or {}).get("gate_fingerprint")
+    # (round 6, finding 5) observations.json first and health.json LAST, each through tmp + os.replace: a write
+    # that fails (ENOSPC is the likely one) leaves no health.json carrying a verdict next to an rc of 2, and
+    # nothing is written after the file that says what the run was. (The log lines below can still fail; the
+    # catch-all in probe.main sets health.json aside as not-a-verdict when anything does.)
+    R.write_json_atomic(os.path.join(run_dir, "observations.json"),
+                        # (round 5, NIT 11) with what `probe.py judge` reads to give the headline this run got
+                        {"cells": observations, "self_checks": a.sc_observations if a else {},
+                         "bringups_complete": complete, "stopped": stopped, "see_red": bool(mutant),
+                         "bringups": recs, "problems": problems}, default=_jsonable)
     R.dump(os.path.join(run_dir, "health.json"), doc)
-    with open(os.path.join(run_dir, "observations.json"), "w", encoding="utf-8") as fh:
-        # (round 5, NIT 11) with what `probe.py judge` reads to give the headline this run got
-        json.dump({"cells": observations, "self_checks": a.sc_observations if a else {},
-                   "bringups_complete": complete, "stopped": stopped, "see_red": bool(mutant),
-                   "bringups": recs, "problems": problems}, fh,
-                  indent=2, sort_keys=True, default=_jsonable)
     log(R.render(rows, rollups))
     log("verdict %s%s" % (verdict, {"PROBE-BROKEN": "  -- NOT PUBLISHABLE",
                                     "SEE-RED-NOT-SEEN": "  -- the mutant was not noticed: the probe cannot see red"
