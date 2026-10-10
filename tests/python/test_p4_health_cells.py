@@ -1519,8 +1519,30 @@ class TestS0Pieces(unittest.TestCase):
 
 # --- Cut 2 -----------------------------------------------------------------------------------------
 
+def _clear_the_stop_mask():
+    """The three stop signals unblocked, any that were pending going to handlers that do nothing; the handlers
+    that were in place are put back. Used at the start and at the end of a test that changes the mask."""
+    import signal
+    stops = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    old = {s: signal.signal(s, lambda n, f: None) for s in stops}
+    try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
+        for _ in range(2000):
+            pass
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+
+
 class TestS0Cut2Checks(unittest.TestCase):
     """m5: S0's two new safety checks decide something, so each is pinned."""
+
+    def setUp(self):
+        # (round 7) The tests of the ValueSet trial compare the signal mask before and after it. A mutant that never
+        # lifts the trial's block leaves the mask blocked for every test after the first, and a test that starts
+        # with the block already up cannot see it not being lifted: each starts, and ends, with the mask clear.
+        _clear_the_stop_mask()
+        self.addCleanup(_clear_the_stop_mask)
 
     def s0(self, replies):
         import tempfile
