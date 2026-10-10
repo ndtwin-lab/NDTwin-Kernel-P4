@@ -539,7 +539,7 @@ mutant 的部分跑（`ONLY_LABEL_PREFIX=…`，**不是 gate**）：`mutate_p4_
 
 ## 11. 第 7 輪（r6 審查的程式項目與文字）
 
-- **基底**：`b518b9fb`（r6 審查的對象；code 在 `b09cd060`，`tools/p4_health` 的 tree＝`4acc71ea`）。**code 與測試的 head：`ae753c29`**（`tools/p4_health` 的 tree＝`349e5ab0a1fa635ddde98e046447e00607f3b84d`）；之後只有這份文件的 commit。`ae753c29` 本身只動 `tests/python/test_grpc_port_block.py`，所以 `tools/p4_health` 的最後一次改動是 `af2b3490`。
+- **基底**：`b518b9fb`（r6 審查的對象；code 在 `b09cd060`，`tools/p4_health` 的 tree＝`4acc71ea`）。**code 與測試的 head：`7a7a2577`**。`tools/p4_health` 的最後一次改動是 `af2b3490`（tree＝`349e5ab0a1fa635ddde98e046447e00607f3b84d`，之後沒有變）；`ae753c29`（項目 4）、`01ba2a41`、`7a7a2577` 只動測試。`ae753c29` 是**第一次** r7 gate 的 head，那次停在 shard 3，見 §11.7；之後的 gate 在 `7a7a2577`。這份文件的 commit 在它們之後。
 - **LOG7** 指 `LOG/r7/`。格式同 §10 開頭：每份 log 第 1 行 `commit <sha>`、最後一行 `rc=`。**例外**：`disk_watchdog.log`（只記錄，沒有 commit 行與 `rc=`）、`v7_polls.log`（等待的紀錄，每行自己有時間，沒有 commit 行與 `rc=`）。
   - `n1.*.RED.log` 在 `aa526f97` 跑（測試已 commit、`tools/` 是 `b518b9fb` 的，`tracked-dirty=0`）；`dirty-pre-commit/` 是同一批紅的第一次跑（測試還沒 commit，`tracked-dirty=2`），**被取代，留著當紀錄**。
   - `n1.collect.RED2.log`、`n3.cells.RED2.log`、`n4.grpc_port_block.RED.log` 是在 **`git archive` 出來的暫存目錄**跑的（log 第 2 行寫 cwd 和「old tools/, new tests」）；原因：測試 commit 之後又有一個很小的測試修正 commit，要在「舊 code＋新測試」的狀態重跑，而 worktree 的 `tools/` 已經是修過的。
@@ -558,6 +558,8 @@ mutant 的部分跑（`ONLY_LABEL_PREFIX=…`，**不是 gate**）：`mutate_p4_
 | `c8c2cef8` | 項目 3 的測試補強（編輯過的 `gen_runtime.py` 不得被**執行**，不只是不被交給 `expectations`） |
 | `af2b3490` | 項目 3 的修與 `C2R7-3a`–`3e` |
 | `ae753c29` | 項目 4：`test_grpc_port_block.py` 的 allowlist 加一行 |
+| `01ba2a41` | gate 修（§11.7）：collect 的每個測試結束時把 signal mask 放回、pending 的停止送到不做事的 handler |
+| `7a7a2577` | gate 修（§11.7）：cells 的 `TestS0Cut2Checks` 每個測試開始與結束都清掉 signal mask |
 
 ### 11.2 每一項
 
@@ -574,12 +576,12 @@ mutant 的部分跑（`ONLY_LABEL_PREFIX=…`，**不是 gate**）：`mutate_p4_
 
 ### 11.3 gate 與最後的檢查
 
-- **mutation gate：這一輪沒有跑，所以沒有 GATE 那一行，也不能說 `C2R7-` 的 23 個 mutant 在 gate 裡被抓過。** 原因是一個外部的卡住，不是結果：
-  - brief 要求先等 V7 的 job 結束（`ternary/v7-r4/driver-r4.out` 出現 `rc=` 開頭的行）才可以跑 gate 或任何 mutation run。**它一直沒有結束**：`driver-r4.out` 是空的，它的 `cmds.log` 最後幾行是 `[df] … before stepA: 1287 MB avail`、`[df] under 1700, waiting 300 s`——V7 自己卡在它的 1700 MB 磁碟門檻上，連 step A 都沒開始。
-  - 我這邊 gate 每個 shard 之前要 `df -m /` Avail ≥ 1800 MB：從 22:07 到 00:42，可用空間一直在 1281–1300 MB（`disk_watchdog.log`，最低取樣 1177 MB 是我自己跑測試時；`v7_polls.log` 每 5 分鐘一行），沒有別人釋放。我能碰的只有自己的檔（`wt-p4-health-cut2` 78 MB、`LOG/r7` 約 1 MB），不夠、也不是我的目的；別的專案的目錄我沒有碰。
-  - 我等了 2 小時 27 分（22:15–00:42），然後用 pid 把等待的行程停掉（§11.4）。**沒有任何 mutation run 在 V7 還沒結束時跑**；唯一的 gate script 執行是 `ONLY_LABEL_PREFIX=C2R6-pin-b` 的單一 mutant 部分跑（brief 允許單一 mutant 的部分跑；22:2x 跑的，那時 V7 已經卡在磁碟門檻上，`mutate_p4_health.partial_C2R6-pin-b.log`：1 mutations, 0 survived）。
-  - **有的證據（都不是 gate）**：(a) `ANCHOR_CHECK=1`：23 個 `C2R7-` 的 anchor 都數到 1；(b) `dev.quickmut_C2R7.log`：開發時用的小工具（不在 repo）——把表裡同一段文字套在暫存複本上，只跑該 mutant 指名的測試，23 個都被指名的測試抓到（`not caught: 0`）；它**不是** gate，不跑負對照、基線、byte-identical，也不看「別的測試有沒有紅」；(c) `mutate_p4_health.partial_C2R6-pin-b.log`。
-  - **要補的**（照 r6 的做法，在 `ae753c29` 或之後只動文件的 HEAD 上）：V7 結束、磁碟 ≥ 1800 MB 之後，先 `ONLY_LABEL_PREFIX=C2R7- bash tests/shell/mutate_p4_health.sh`（23 個，約 20 分鐘），再 `MUT_SHARD=k/4`（k＝0–3）一份一份跑（每份之前再查磁碟；表現在 473 個，份數約 119／118／118／118），最後 `tests/shell/sum_p4_health_gate_shards.sh --commit ae753c29f00b9fef043faf0b0993e60e2744e0bd <四份 log>`。有存活就補測試、在新的 head 上四份重跑。
+- **mutation gate：這一輪還沒有 GATE 那一行。** 狀態：
+  - **第一次 gate（head `ae753c29`）不算數**：shard 0–2 `rc=0`，shard 3 在 `C2R6-4c` 被 REFUSED（沒有套件結果）；原因與修見 §11.7。logs 在 `LOG/r7/first_gate_ae753c29/`。
+  - **第二次 gate 在 `7a7a2577`**（`tools/p4_health` 的 tree＝`349e5ab0…`，與第一次相同）：**shard 0 完成，`rc=0`**——`mutate_p4_health.shard0of4.log`：第 1 行 `commit 7a7a2577…`，header 的 HEAD／tree 同，`subject sha: 4651b09cb90a1387`，`gates sum: e4082a69a7af6149`，基線、負對照、byte-identical（`tools/p4_health` 與 gate 的三支 script）與之後的檢查全綠，**119 mutations, 0 survived**（119 個 `✅ caught`，沒有 SURVIVED、WRONG TEST、REFUSED、HUNG 的行），`SHARD 0/4 of 473`，13:37:19–15:21:38。
+  - **shard 1–3 沒有跑**：15:21 起 `df -m /` Avail 只有 1427 MB，之後降到 1298 MB（`gate_disk_polls.log`、`disk_watchdog.r7b.log`），低於 gate 的 1800 MB，也低於 Adam 為這一次核准的 1700 MB 下限（orchestrator 13:37 的訊息：移除 V7 worktree 與 Cut A 的 scratch clone 之後曾回到 1820 MB，shard 0 就是那時起跑的）。16:42 我在 driver 的等待迴圈裡（沒有 shard 在跑）用 pid 停了它，原因記在 `gate_disk_polls.log` 最後一行。
+  - **所以：沒有 GATE 那一行，`C2R7-` 的 23 個 mutant 與 `C2R6-4c` 在 gate 裡的 verdict 還沒有（shard 0 的 119 個裡有 7 個 `C2R7-`／`C2R6-4` 的，都 caught）。** 有的證據（不是 gate）：§11.7 的部分跑；`dev.quickmut_C2R7.log`。
+  - **要補的**（在 `7a7a2577` 或之後只動文件的 HEAD 上，磁碟 ≥ 1700 MB）：`START=1 gate_driver1700.sh 7a7a257734eee3cd8966c783f77101b3cd56d863`（session scratchpad 裡的腳本；等價於：`MUT_SHARD=1/4`、`2/4`、`3/4` 一份一份跑，每份之前查 `df`，然後 `tests/shell/sum_p4_health_gate_shards.sh --commit 7a7a257734eee3cd8966c783f77101b3cd56d863` 加四份 log，shard 0 用上面那一份）。有存活就補測試、在新的 head 上四份重跑。
 - **最後的檢查**（`p4_proxy/venv/bin/python`；log 第 1 行是文件 commit，`LOG/r7/final.*.log`）：
   - `check_gate_anchors.py HEAD`：133/133 cells ok，`mutate_p4_health.sh` **ok(438)**（`final.check_gate_anchors.log`）。438 的算法同 §10.3：473 列 → 437 個不同的 anchor，加負對照的 1 個；有 30 個 anchor 被不只一列用到（36 列重複）。
   - `check_test_tmpdirs.py`：416 個檔，0 個固定暫存路徑（`final.check_test_tmpdirs.log`）；
@@ -587,13 +589,12 @@ mutant 的部分跑（`ONLY_LABEL_PREFIX=…`，**不是 gate**）：`mutate_p4_
 
 ### 11.4 磁碟與輔助行程
 
-- **磁碟**：`df -m /` Avail 22:07 是 1284 MB，之後到 00:42 都在 1281–1300 MB（`disk_watchdog.log`：310 筆取樣，最低 1177 MB、最高 1300 MB；`end` 行 1287 MB）。低於 gate 的 1800 MB 門檻，也低於 §6 第一次 live 的 2500 MB 下限；今天（10-09／10-10）不能開 live，gate 也不能開。
-- **輔助行程**（都只寫 log、不送訊號；這一輪沒有 STOP／CONT／kill 的看守）：
-  - 磁碟取樣器 `watchdog.sh`（pid 858158／858160，`setsid --wait`）：用停止檔讓它自己結束（`disk_watchdog.log` 最後一行 `end 2026-10-10 00:42:20`）；
-  - 等 V7 的輪詢 `waitv7.sh`（pid 943308／943310／943311）、跑完 `C2R7-` 部分跑與四個 shard 的串接腳本 `pipeline.sh`（pid 960107／960109；它只在 V7 結束後才會開始，一直在等，從沒開始任何 mutation run）、兩個等檔案出現的 `until grep` 迴圈（pid 960765／960949）：00:42 用 `kill <pid>` 停掉；
-  - 一個 Monitor（tail 兩個 log，30 分鐘到期，自己結束）。
-  - **結束時的 `ps -eo pid,etime,args` 檢查**：沒有 `pipeline.sh`、`waitv7`、`watchdog.sh`、`gate_driver`、`until grep` 的行；剩下的 `/bin/bash -c source …shell-snapshot…`（etime 8–9 小時，pid 3581287／3620620／3628980）不是我起的（我最早的 pid 是 858158）。
-  - r5 的看門狗（r6 最後一次 gate 被它停住，§10.3）：`ps` 沒有它。
+- **磁碟**：第一階段（V7 還沒結束）22:07–00:42 在 1281–1300 MB（`disk_watchdog.log`：310 筆，最低 1177、最高 1300；`end` 1287）。第二階段（`disk_watchdog.r7b.log`，10-10 10:0x 起）：10:57 起 1676–1679 MB，13:37 回到 1820 MB（orchestrator 移除 V7 worktree 與 Cut A scratch clone 後），shard 0 在 13:37:19 起跑（`gate_disk_polls.log`）；15:21 shard 0 結束時 1427 MB，降到 1298 MB；取樣最低 1264 MB、最高 1817 MB。都低於 §6 第一次 live 的 2500 MB 下限；今天不能開 live。
+- **輔助行程**（都只寫 log、不送訊號）：
+  - 第一階段：磁碟取樣器 `watchdog.sh`（pid 858158／858160）、`waitv7.sh`（943308／943310／943311）、`pipeline.sh`（960107／960109）、兩個 `until grep` 迴圈（960765／960949）、一個 Monitor：結束情形見上一版（取樣器用停止檔，其餘 `kill <pid>`）。
+  - 第二階段：部分跑串接腳本 `partials.sh`／`partials2.sh`（pid 895241／895243 等，各自跑完自己結束）；磁碟取樣器 `watchdog.sh`（pid 2003882／2003884，停止檔，`end 2026-10-10 16:42:32`）；gate driver `gate_driver.sh`（pid 2003737／2003739，16:42 在等待迴圈裡用 `kill <pid>` 停掉；它啟動的 shard 0 已經正常結束）。
+  - **結束時的 `ps -eo pid,etime,args` 檢查**：沒有 `gate_driver`、`watchdog.sh`、`mutate_p4_health`、`partials`、`pipeline` 的行；
+  - r5 的看門狗：`ps` 沒有它；這一輪沒有任何 STOP／CONT／kill 的看守。
 
 ### 11.5 還開著的
 
@@ -613,3 +614,17 @@ mutant 的部分跑（`ONLY_LABEL_PREFIX=…`，**不是 gate**）：`mutate_p4_
   3. **`ERROR:` 前綴與 gate 的解析**：`probe.py` 的 catch-all 印的行以 `ERROR:` 開頭，gate 的 `FAIL|ERROR: <name>` 解析（`mutate_p4_health.sh` 的 red_tests）把它讀成測試名字，在紅清單裡加一個假的「the」（r6 `shard1:500`、`:506`）。沒有任何指名的測試叫 `the`，所以沒有 verdict 改變。**沒有改**（brief：留成註記）。
   4. gate script 沒有逐個 mutant 的時間戳，所以停止的分析是估計（§10.3）。
   5. **看守**：r5 的磁碟看門狗（會對 shard 行程送 SIGSTOP）是 r6 最後一次 gate 被停的原因（§10.3）；這一輪沒有任何會送訊號的輔助行程，結束時用 `ps` 確認沒有任何一個留下（§11.4）。
+
+
+### 11.7 第一次 r7 gate 停在 shard 3：原因與修
+
+- **發生了什麼**：orchestrator 在 V7 結束之後跑了 `gate_driver.sh ae753c29`（四份 shard 一份一份跑；log 在 `LOG/r7/first_gate_ae753c29/`，log 第 1 行的 commit 是 `67af72b3`，即 `ae753c29` 加這份文件的第一版，`tools/` 與 `tests/` 與 `ae753c29` 相同）。shard 0、1、2 `rc=0`（119、118、118 個，0 存活）；**shard 3 在 09:59:12 `rc=2`**：`mutate_p4_health.shard3of4.log:638`「🔴 REFUSED: a suite did not run at all while measuring: C2R6-4c. the mask is never lifted. No verdict.」。`C2R6-4c` 在 r6 被抓到過。**這一次 gate 不算數**（shard 3 沒有 verdict，也沒有 GATE 那一行）。
+- **原因**（讀的是 gate script 丟掉的套件輸出：在暫存複本套上 `C2R6-4c`，直接跑兩個套件，python3.8、`timeout 300`；`LOG/r7/r7b/repro.4c.collect.log`、`repro.4c.cells.log`，HEAD 是 `67af72b3`）：
+  - cells 在 4c 下 `rc=0`（沒有測試抓到 4c；它的預期測試在 collect）。
+  - **collect 不是掛住，是被一個 `KeyboardInterrupt` 打斷**，沒有印 `Ran N tests`，gate 把「沒有結果」當作 `NO-SUITE`，也就是 REFUSED（`red_tests` 的 `grep -qE '^Ran [0-9]+ tests?'`）。trace 在 log 末端：`test_p4_health_collect.py:3338, in test_a_running_thread_that_does_not_block_sigint_is_refused_too` → `:3260, in background_thread`（`old = signal.pthread_sigmask(signal.SIG_SETMASK, set(blocked))`）→ `KeyboardInterrupt`。
+  - 機制：4c 讓每一輪結束後三個停止訊號**一直是擋住的**，所以前面的測試送出的訊號都留在 pending。我在 r7 加的 `background_thread` 為了讓新 thread 繼承某個 mask，用 `SETMASK` 把 SIGINT 解開（這個測試要的 mask 是 `{SIGTERM, SIGHUP}`）；pending 的 SIGINT 就在這一行送達，Python 預設的 SIGINT handler 丟 `KeyboardInterrupt`，unittest 不攔它，整個套件結束。r6 的測試沒有在一個會洩漏 mask 的 mutant 之後還改 mask，所以 r6 沒碰到。
+  - orchestrator 的猜測對了一半：是 r7 新加的 thread 測試的 helper；但不是 `set_wakeup_fd` 的等待（它有 0.5 秒上限），也不是「跑不完」。
+- **修一（`01ba2a41`，測試）**：`Sealed.setUp` 記下測試開始時的 mask，cleanup 把它放回，放回的當下 pending 的停止送到不做事的 handler（`_put_the_signal_mask_back`）。一個洩漏 mask 的 mutant 因此只影響會洩漏的那個測試。**4c 的預期測試不變**（`test_a_stop_from_a_hook_inside_finish_after_it_read_the_teardown_signal_means_b_is_not_claimed`）。紅：`repro.4c.collect.log`（修之前）；修之後在同一個 4c 複本上套件跑完，4 個測試紅，包括預期的那個（`repro.4c.fixed.collect.log`，`repro.4c.fixed.cells.log` 綠）；gate 的部分跑 `mutate_p4_health.partial_r7b_C2R6-4c.log`：caught。
+- **修一之後的部分跑發現同類的第二個洞（`7a7a2577`，測試）**：`C2R7-1n`（S0 的 trial block 不放開）是 `WRONG TEST`（`mutate_p4_health.partial_r7b_C2R7-1.first_01ba2a41.log`）。cells 的 `TestS0Cut2Checks` 在 1n 下第一個測試之後 mask 一直是擋住的，後面那個「比較 trial 前後的 mask」的指名測試一開始就在擋住的狀態，看不到「沒放開」。1n 在 shard 3 的份裡（表的位置 463，463 mod 4＝3），所以第一次 gate 在同一處也會被它擋下。修：這個 class 的每個測試開始與結束都把 mask 清掉（`_clear_the_stop_mask`）；在 1n 的複本上整個 cells 套件：指名的測試與另外三個紅。
+- **修完之後的部分跑**（gate script 的 `ONLY_LABEL_PREFIX`，都不是 gate；`C2R6-4c`、`C2R7-3` 跑在 `01ba2a41`，`C2R6-4`、`C2R7-1` 重跑在 `7a7a2577`）：`mutate_p4_health.partial_r7b_C2R6-4c.log`（1 個，caught）、`…_C2R6-4.log`（`4a`–`4e` 5 個，0 存活）、`…_C2R7-1.log`（18 個，0 存活）、`…_C2R7-3.log`（5 個，0 存活；`7a7a2577` 沒有碰它的測試）。每份的第 1 行是它跑的 commit。
+- **沒有改的**：mutant、gate 的規則、`tools/`。
